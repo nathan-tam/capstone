@@ -5,7 +5,7 @@ This documentation details the methodology used to simulate Host Mobility in an 
 Simulating this in a containerized network test environment (Mininet/Topotest) is challenging because we don't have real hosts to move around. We attempt to simulate this behavior using Linux MACVLAN interfaces.
 ### Simulation
 Instead of moving physical hosts, we use Linux MACVLAN interfaces to represent endpoints. Essentially, we deploy a dummy switch connected to the VTEP to anchor virtual links (our MACVLAN interfaces) onto. This makes it seem like our MACVLAN interfaces are directly connected to the VTEP (meaning traffic from a MACVLAN interface looks exactly like traffic from a distinct physical device attached to the wire). Note that the interfaces are viewable by issuing `ifconfig` in the Docker container.
-##### How it Works, Technically
+#### How it Works, Technically
 The script performs the following logic to simulate a migration:
 1. An endpoint (e.g., `dummy1` with IP `192.168.0.19`) is created on `host1`.
 2. `host1` sends traffic. `vtep1` learns the MAC/IP and advertises it via BGP EVPN to the fabric.
