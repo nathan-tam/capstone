@@ -11,7 +11,7 @@ The script performs the following logic to simulate a migration:
 2. `host1` sends traffic. `vtep1` learns the MAC/IP and advertises it via BGP EVPN to the fabric.
 3. The script executes `ip link delete dummy1` on `host1`.
 4. The endpoint effectively disappears from the original location.
-5. The script immediately executes `ip link add link vtepbond name dummy1 type macvlan mode bridge` on `host2`.
+5. The script executes `ip link add link vtepbond name dummy1 type macvlan mode bridge` on `host2`.
 6. It assigns the exact same MAC and IP (`192.168.0.19`) to this new interface.
 7. The interface is brought up
 9. As soon as the migrated interfaces sends a message, `vtep2` will send a BGP RA to the spine.
