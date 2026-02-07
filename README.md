@@ -1,83 +1,19 @@
-<p align="center">
-<img src="http://docs.frrouting.org/en/latest/_static/frr-icon.svg" alt="Icon" width="20%"/>
-</p>
-
-FRRouting
-=========
-
-FRR is free software that implements and manages various IPv4 and IPv6 routing
-protocols. It runs on nearly all distributions of Linux and BSD and
-supports all modern CPU architectures.
-
-FRR currently supports the following protocols:
-
-* BGP
-* OSPFv2
-* OSPFv3
-* RIPv1
-* RIPv2
-* RIPng
-* IS-IS
-* PIM-SM/MSDP
-* LDP
-* BFD
-* Babel
-* PBR
-* OpenFabric
-* VRRP
-* EIGRP (alpha)
-* NHRP (alpha)
-
-Installation & Use
-------------------
-
-For source tarballs, see the
-[releases page](https://github.com/FRRouting/frr/releases).
-
-For Debian and its derivatives, use the APT repository at
-[https://deb.frrouting.org/](https://deb.frrouting.org/).
-
-Instructions on building and installing from source for supported platforms may
-be found in the
-[developer docs](http://docs.frrouting.org/projects/dev-guide/en/latest/building.html).
-
-Once installed, please refer to the [user guide](http://docs.frrouting.org/)
-for instructions on use.
-
-Community
----------
-
-The FRRouting email list server is located
-[here](https://lists.frrouting.org/listinfo) and offers the following public
-lists:
-
-| Topic             | List                         |
-|-------------------|------------------------------|
-| Development       | dev@lists.frrouting.org      |
-| Users & Operators | frog@lists.frrouting.org     |
-| Announcements     | announce@lists.frrouting.org |
-
-For chat, we currently use [Slack](https://frrouting.slack.com). You can join
-by clicking the "Slack" link under the
-[Participate](https://frrouting.org/community) section of our website.
-
-
-Contributing
-------------
-
-FRR maintains [developer's documentation](http://docs.frrouting.org/projects/dev-guide/en/latest/index.html)
-which contains the [project workflow](http://docs.frrouting.org/projects/dev-guide/en/latest/workflow.html)
-and expectations for contributors. Some technical documentation on project
-internals is also available.
-
-We welcome and appreciate all contributions, no matter how small!
-
-
-Security
---------
-
-To report security issues, please use our security mailing list:
-
-```
-security [at] lists.frrouting.org
-```
+# Simulating Host Mobility in Topotest with FRRouting
+This documentation details the methodology used to simulate Host Mobility in an EVPN/VXLAN fabric using FRRouting Topotests.
+### Overview
+"Host Mobility" usually refers to a host migrating from one Access Point to another while retaining its MAC and IP address. The network fabric (EVPN) must detect this move and update its routing tables to send traffic to the new location.<br>
+Simulating this in a containerized network test environment (Mininet/Topotest) is challenging because we don't have real hosts to move around. We attempt to simulate this behavior using Linux MACVLAN interfaces.
+### Simulation
+Instead of moving physical hosts, we use Linux MACVLAN interfaces to represent endpoints. Essentially, we deploy a dummy switch connected to the VTEP to anchor virtual links (our MACVLAN interfaces) onto. This makes it seem like our MACVLAN interfaces are directly connected to the VTEP (meaning traffic from a MACVLAN interface looks exactly like traffic from a distinct physical device attached to the wire). Note that the interfaces are viewable by issuing `ifconfig` in the Docker container.
+#### How it Works, Technically
+The script performs the following logic to simulate a migration:
+1. An endpoint (e.g., `dummy1` with IP `192.168.0.19`) is created on `host1`.
+2. `host1` sends traffic. `vtep1` learns the MAC/IP and advertises it via BGP EVPN to the fabric.
+3. The script executes `ip link delete dummy1` on `host1`.
+4. The endpoint effectively disappears from the original location.
+5. The script executes `ip link add link vtepbond name dummy1 type macvlan mode bridge` on `host2`.
+6. It assigns the exact same MAC and IP (`192.168.0.19`) to this new interface.
+7. The interface is brought up
+9. As soon as the migrated interfaces sends a message, `vtep2` will send a BGP RA to the spine.
+10. The spine will then advertise that information to the rest of the network.
+11. Other VTEPs receive the update and switch their routing path from `vtep1` to `vtep2`.
