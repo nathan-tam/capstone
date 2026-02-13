@@ -13,10 +13,11 @@ import json
 import platform
 from functools import partial
 
-# Import topogen and topotest helpers
+# import topogen and topotest helpers
 from lib import topotest
 from lib.topogen import Topogen, TopoRouter, get_topogen
 
+# select markers based on daemons used during test
 pytestmark = [pytest.mark.bgpd, pytest.mark.pimd]
 
 # Save the Current Working Directory
@@ -27,6 +28,7 @@ sys.path.append(os.path.join(CWD, "../"))
 ##   Network Topology Definition
 #####################################################
 
+# function we pass to Topogen to build our topology
 def build_topo(tgen):
     tgen.add_router("spine1")
     tgen.add_router("spine2")
@@ -314,6 +316,24 @@ def test_mobility():
     vm_mac = "00:aa:bb:cc:dd:99"
     gateway_ip = "45.0.0.1"     # anycast Gateway
 
+    # start our packet capturing
+    print("\nStarting Packet Capturing on spine1...")
+    spine = tgen.gears["spine1"]
+    pcap_dir = os.path.join(tgen.logdir, "spine1")
+    pcap_file = os.path.join(pcap_dir, "evpn_mobility.pcap")
+    spine.run("mkdir -p {}".format(pcap_dir))
+    # capture on spine for BGP (TCP/179). Use full flags so tcpdump
+    # runs detached and writes immediately (-s 0). Save pid for cleanup.
+    spine.run(
+        "tcpdump -nni any -s 0 -w {} port 179 & echo $! > /tmp/tcpdump_evpn.pid".format(
+            pcap_file
+        ),
+        stdout=None,
+    )
+
+    # give tcpdump a moment to start (necessary?)
+    time.sleep(1)
+    
     print("\n=== Starting Mobility Simulation Test ===\n")
 
     # --- Step 1: Deploy on hostd11 (VTEP 1) --- #
@@ -351,7 +371,14 @@ def test_mobility():
     assert success, "Ping failed from Location B (hostd21) after migration"
     
     print("SUCCESS: Location B connectivity established. Mobility simulation complete.")
-    tgen.mininet_cli()
+
+    # stop capture and flush output
+    spine.run("if [ -f /tmp/tcpdump_evpn.pid ]; then kill $(cat /tmp/tcpdump_evpn.pid); fi")
+    spine.run("sleep 1")
+
+    # run test with MUNET_CLI=1 to drop into CLI after test completes
+    if os.getenv("MUNET_CLI") == "1":
+        tgen.mininet_cli()  # this drops you into the 'munet>' prompt
 
 if __name__ == "__main__":
     args = ["-s"] + sys.argv[1:]
