@@ -1,5 +1,5 @@
 # Simulating Host Mobility in Topotest with FRRouting
-This documentation details the methodology used to simulate Host Mobility in an EVPN/VXLAN fabric using FRRouting Topotests.
+This documentation details the methodology used to simulate Host Mobility in an EVPN/VXLAN fabric using FRRouting Topotests. It also serves as some basic guidance for running experiments and analysing results.
 ### Overview
 "Host Mobility" usually refers to a host migrating from one Access Point to another while retaining its MAC and IP address. The network fabric (EVPN) must detect this move and update its routing tables to send traffic to the new location.<br>
 Simulating this in a containerized network test environment (Mininet/Topotest) is challenging because we don't have real hosts to move around. We attempt to simulate this behavior using Linux MACVLAN interfaces.
@@ -17,8 +17,8 @@ The script performs the following logic to simulate a migration:
 9. As soon as the migrated interfaces sends a message, `vtep2` will send a BGP RA to the spine.
 10. The spine will then advertise that information to the rest of the network.
 11. Other VTEPs receive the update and switch their routing path from `vtep1` to `vtep2`.
-##### Packet Capturing
-When the test runs it automatically captures packets from, at the time of writing, the `spine1` node. You'll see some output from the test that will look like:
+### Packet Capturing
+When the test runs it automatically captures BGP packets from, at the time of writing, the `spine1` node. You'll see something like the output below. Currently, the test does not capture any ICMP packets. That functionality should be added to actually verify connectivity outside of what the script tells us. If you're reading this message, it hasn't been fixed.
 ```output
 148 packets captured
 156 packets received by filter
@@ -34,3 +34,7 @@ Then, once you have the path, run this command on the host:
 docker cp <container_id>:/path/to/evpn_mobility.pcap ./evpn_mobility.pcap
 ```
 Note that every time you run the test it will overwrite the `.pcap` file.
+
+#### Wireshark
+To filter for BGP Update packets (remember, Withdraw messages are part of Update messages) we can use the following Wireshark filters to find what we're looking for:
+* `bgp.type == 2` will show all BGP Update messages captured.
