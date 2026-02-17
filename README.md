@@ -22,7 +22,8 @@ The script performs the following logic to simulate a migration:
 11. Other VTEPs receive the update and switch their routing path from `vtep1` to `vtep2`.
 #### Running the Experiment
 We assume you have already followed a guide setup your FRRouting workspace.
-1. From the root of your workspace, launch the container: `docker start $(whoami)-$(basename /bin/pwd)-frr-ubuntu20`.
-2. And attach to it: `docker attach $(whoami)-$(basename /bin/pwd)-frr-ubuntu20`.
+1. From the root of your workspace, launch the container: `docker start $(whoami)-$(basename /bin/pwd)-frr-ubuntu22`.
+2. And attach to it: `docker attach $(whoami)-$(basename /bin/pwd)-frr-ubuntu22`.
 3. Navigate to the tests directory: `cd ~/frr/tests/topotests`.
-4. Run `sudo -E pytest -s --pause --vtysh=torm11 bgp_evpn_capstone`. This will launch the topology and connect you to router `torm11`.
+4. Start a `tmux` session.
+5. Run `sudo -E pytest -s bgp_evpn_capstone` and wait for the test to finish.
