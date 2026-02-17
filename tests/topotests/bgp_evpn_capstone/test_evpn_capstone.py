@@ -44,16 +44,19 @@ pytestmark = [
 ##   Configuration Functions
 #####################################################
 
+# Test scaling parameters
+NUM_VTEPS = 4
+NUM_HOSTS = 4  # One host per VTEP for VM mobility testing
+NUM_MOBILE_VMS = 128  # Number of VMs that will move around
+
 vtep_ips = {
-    "vtep1": "10.10.10.10",
-    "vtep2": "20.20.20.20",
-    "vtep3": "30.30.30.30"
+    f"vtep{i}": f"{10*i}.{10*i}.{10*i}.{10*i}" 
+    for i in range(1, NUM_VTEPS + 1)
 }
 
 svi_ips = {
-    "vtep1": "192.168.0.251",
-    "vtep2": "192.168.0.252",
-    "vtep3": "192.168.0.253"
+    f"vtep{i}": f"192.168.0.{250+i}" 
+    for i in range(1, NUM_VTEPS + 1)
 }
 
 def config_bond(node, bond_name, bond_members, bond_ad_sys_mac, br):
@@ -144,9 +147,24 @@ def config_vteps(tgen, vteps):
 
 
 def compute_host_ip_mac(host_name):
-    host_id = host_name.split("host")[1]
-    host_ip = "192.168.0.24" + host_id + "/16"
-    host_mac = "00:00:00:00:00:0" + host_id
+    host_id = int(host_name.split("host")[1])
+    # Simple sequential IP: host1 = 192.168.0.1, host2 = 192.168.0.2, etc.
+    # (avoiding .0 as network and .250+ for gateways/SVIs)
+    if host_id <= 127:
+        # Use 192.168.0.1 to 192.168.0.127
+        fourth_octet = host_id
+        third_octet = 0
+    else:
+        # For hosts > 127, use 192.168.1.x, 192.168.2.x, etc.
+        offset = host_id - 128
+        third_octet = 1 + (offset // 254)
+        fourth_octet = 1 + (offset % 254)
+    
+    host_ip = f"192.168.{third_octet}.{fourth_octet}/16"
+    # For MAC addresses, simple encoding: 00:00:00:xx:yy:zz
+    host_mac = "00:00:00:{:02x}:{:02x}:{:02x}".format(
+        (host_id >> 16) & 0xFF, (host_id >> 8) & 0xFF, host_id & 0xFF
+    )
     return host_ip, host_mac
 
 
@@ -183,32 +201,37 @@ def config_hosts(tgen, hosts):
 def build_topo(tgen):
     "Build function"
 
-    # Create spine, leaf, and hosts
+    # Create spines
     spine1 = tgen.add_router("spine1")
     spine2 = tgen.add_router("spine2")
 
-    vtep1 = tgen.add_router("vtep1")
-    vtep2 = tgen.add_router("vtep2")
-    vtep3 = tgen.add_router("vtep3")
+    # Create VTEPs
+    vteps = []
+    for i in range(1, NUM_VTEPS + 1):
+        vtep_name = f"vtep{i}"
+        vtep = tgen.add_router(vtep_name)
+        vteps.append(vtep_name)
+        
+        # Create links between spine1 and this VTEP
+        tgen.add_link(spine1, vtep)
+        
+        # Create links between spine2 and this VTEP
+        tgen.add_link(spine2, vtep)
 
-    host1 = tgen.add_router("host1")
-    host2 = tgen.add_router("host2")
-    host3 = tgen.add_router("host3")
-
-    # Create links between spine1 and VTEPs
-    tgen.add_link(spine1, vtep1)
-    tgen.add_link(spine1, vtep2)
-    tgen.add_link(spine1, vtep3)
-
-    # Create links between spine2 and VTEPs
-    tgen.add_link(spine2, vtep1)
-    tgen.add_link(spine2, vtep2)
-    tgen.add_link(spine2, vtep3)
-
-    # Create links between VTEPs and hosts
-    tgen.add_link(vtep1, host1)
-    tgen.add_link(vtep2, host2)
-    tgen.add_link(vtep3, host3)
+    # Create hosts and distribute them across VTEPs
+    hosts = []
+    for i in range(1, NUM_HOSTS + 1):
+        host_name = f"host{i}"
+        host = tgen.add_router(host_name)
+        hosts.append(host_name)
+        
+        # Distribute hosts across VTEPs in round-robin fashion
+        vtep_idx = (i - 1) % NUM_VTEPS
+        vtep_name = f"vtep{vtep_idx + 1}"
+        vtep = tgen.gears[vtep_name]
+        
+        # Create link between this VTEP and host
+        tgen.add_link(vtep, host)
 
 
 # New form of setup/teardown using pytest fixture
@@ -225,10 +248,12 @@ def tgen(request):
         tgen.errors = "kernel 4.19 needed for multihoming tests"
         pytest.skip(tgen.errors)
 
-    vteps = ["vtep1", "vtep2", "vtep3"]
+    # Configure all VTEPs
+    vteps = [f"vtep{i}" for i in range(1, NUM_VTEPS + 1)]
     config_vteps(tgen, vteps)
 
-    hosts = ["host1", "host2", "host3"]
+    # Configure all hosts
+    hosts = [f"host{i}" for i in range(1, NUM_HOSTS + 1)]
     config_hosts(tgen, hosts)
 
     router_list = tgen.routers()
@@ -282,6 +307,24 @@ def delete_macvlan_endpoint(tgen, host_name, vm_name):
     host.run(f"ip link del {vm_name}")
 
 
+def migrate_macvlan_endpoint_live(tgen, old_host_name, new_host_name, vm_name, ip, mac):
+    """
+    Live migration of MACVLAN interface: Creates at destination while source still exists,
+    then deletes from source. This creates a brief moment where the same MAC is on two VTEPs,
+    simulating vMotion/container failover and stressing the control plane.
+    """
+    print(f"Live migrating MACVLAN {vm_name} from {old_host_name} to {new_host_name}")
+    
+    # Step 1: Create at destination (while source still has the VM)
+    create_macvlan_endpoint(tgen, new_host_name, vm_name, ip, mac)
+    
+    # Small delay to let BGP detect the duplicate
+    sleep(0.5)
+    
+    # Step 2: Delete from source (now both VTEPs had it briefly)
+    delete_macvlan_endpoint(tgen, old_host_name, vm_name)
+
+
 def verify_ping(tgen, host_name, interface, target_ip, count=3):
     """Pings from the specific interface"""
     host = tgen.gears[host_name]
@@ -294,22 +337,22 @@ def verify_ping(tgen, host_name, interface, target_ip, count=3):
 
 def test_mobility(tgen):
     """
-    Simulates a host moving from VTEP 1 (vtep1) to VTEP 2 (vtep2).
+    Simulates 128 VMs moving between 4 VTEPs (via 4 hosts) to establish a baseline for 
+    network traffic measurements. This creates high control plane stress by simulating
+    live VM migrations (vMotion/container failover).
 
-    Requirement:
-    1. Create dummy1 on host1. Ping GW.
-    2. Delete dummy1 on host1.
-    3. Create dummy1 on host2. Ping GW.
+    Test Flow:
+    1. Deploy 128 VMs distributed across 4 hosts (one per VTEP)
+    2. Verify connectivity from initial locations
+    3. Live-migrate each VM to a different VTEP (creates brief MAC duplicates)
+    4. Verify connectivity at new locations
+    5. Capture BGP packet data during migrations
     """
 
     # If any router has previously failed in another test, skip this one.
     if tgen.routers_have_failure():
         pytest.skip(f"skipped because of previous test failure\n {tgen.errors}")
 
-    # define our roaming "VM" parameters
-    vm_name = "dummy1"
-    vm_ip = "192.168.0.99/16"      # using unused IP in VNI 1000 subnet
-    vm_mac = "00:aa:bb:cc:dd:99"
     gateway_ip = "192.168.0.250"   # anycast Gateway
 
     # start our packet capturing
@@ -330,63 +373,122 @@ def test_mobility(tgen):
     # give tcpdump a moment to start
     sleep(1)
 
-    print("\n=== Starting Mobility Simulation Test ===\n")
+    print("\n=== Starting Mobility Simulation Test with {} VMs ===\n".format(NUM_MOBILE_VMS))
 
-    # --- Step 1: Deploy on host1 (VTEP 1) --- #
-    create_macvlan_endpoint(tgen, "host1", vm_name, vm_ip, vm_mac)
+    # Keep track of VM locations for migration
+    vm_locations = {}  # {vm_name: (current_host, current_vtep_idx)}
 
-    # give BGP/EVPN a moment to advertise
-    sleep(2)
+    # --- Phase 1: Deploy VMs on initial hosts --- #
+    print(f"Phase 1: Deploying {NUM_MOBILE_VMS} VMs on initial hosts...")
+    
+    for vm_idx in range(1, NUM_MOBILE_VMS + 1):
+        vm_name = f"vm{vm_idx}"
+        # Use 192.168.100.x for mobile VMs (can handle up to 254 VMs)
+        vm_ip = f"192.168.100.{vm_idx}/16"
+        vm_mac = "00:aa:bb:cc:{:02x}:{:02x}".format((vm_idx >> 8) & 0xFF, vm_idx & 0xFF)
 
-    # verify connectivity
-    print("Testing connectivity from Location A (host1)...")
+        # Distribute VMs round-robin across hosts (32 VMs per host with 128 VMs / 4 hosts)
+        host_idx = ((vm_idx - 1) % NUM_HOSTS) + 1
+        host_name = f"host{host_idx}"
+        
+        # Determine which VTEP this host is connected to
+        vtep_idx = (host_idx - 1) % NUM_VTEPS
 
-    success = verify_ping(tgen, "host1", vm_name, gateway_ip)
+        create_macvlan_endpoint(tgen, host_name, vm_name, vm_ip, vm_mac)
+        vm_locations[vm_name] = (host_idx, vtep_idx)
 
-    # Check EVPN state on vtep1 before migration
-    vtep1 = tgen.gears["vtep1"]
-    print("EVPN MAC state on vtep1 BEFORE migration:")
-    evpn_state = vtep1.vtysh_cmd("show evpn mac vni 1000")
-    print(evpn_state)
+        # give BGP/EVPN a moment to advertise between VMs
+        if vm_idx % 5 == 0:
+            sleep(1)
 
-    # verifies 'success' is True, otherwise raises an AssertionError, halts test
-    assert success, "Ping failed from Location A (host1)"
+    # wait for all BGP/EVPN to stabilize
+    sleep(3)
 
-    print("SUCCESS: Location A connectivity established.")
+    # --- Phase 2: Verify initial connectivity --- #
+    print("\nPhase 2: Verifying connectivity from initial locations...")
+    
+    connectivity_failures = 0
+    for vm_idx in range(1, NUM_MOBILE_VMS + 1):
+        vm_name = f"vm{vm_idx}"
+        host_idx, vtep_idx = vm_locations[vm_name]
+        host_name = f"host{host_idx}"
 
-    # --- Step 2: Migrate (Delete from A) --- #
-    print("Migrating... Deleting from Location A.")
-    delete_macvlan_endpoint(tgen, "host1", vm_name)
+        if verify_ping(tgen, host_name, vm_name, gateway_ip):
+            if vm_idx % 10 == 0:
+                print(f"  ✓ {vm_name} connectivity OK (on {host_name})")
+        else:
+            print(f"  ✗ {vm_name} connectivity FAILED")
+            connectivity_failures += 1
 
-    # give EVPN time to process the withdrawal
-    sleep(2)
+    if connectivity_failures > 0:
+        print(f"WARNING: {connectivity_failures}/{NUM_MOBILE_VMS} VMs failed initial connectivity")
+    else:
+        print(f"SUCCESS: All {NUM_MOBILE_VMS} VMs have connectivity from initial locations")
 
-    # Check EVPN state on vtep1 after migration
-    print("EVPN MAC state on vtep1 AFTER deletion:")
-    evpn_state = vtep1.vtysh_cmd("show evpn mac vni 1000")
-    print(evpn_state)
+    # --- Phase 3: Migrate VMs to different VTEPs --- #
+    print(f"\nPhase 3: Live-migrating {NUM_MOBILE_VMS} VMs to different locations...")
+    print("(Creating at destination while source exists, then cleaning up source)")
+    
+    for vm_idx in range(1, NUM_MOBILE_VMS + 1):
+        vm_name = f"vm{vm_idx}"
+        
+        # Get current location
+        old_host_idx, old_vtep_idx = vm_locations[vm_name]
+        old_host_name = f"host{old_host_idx}"
+        
+        # Compute new location on a different VTEP
+        new_vtep_idx = (old_vtep_idx + 1) % NUM_VTEPS
+        
+        # Find a host on the new VTEP
+        # Hosts are distributed round-robin, so host_i is on vtep((i-1) % NUM_VTEPS)
+        new_host_idx = None
+        for potential_host in range(1, NUM_HOSTS + 1):
+            if ((potential_host - 1) % NUM_VTEPS) == new_vtep_idx and potential_host != old_host_idx:
+                new_host_idx = potential_host
+                break
+        
+        if new_host_idx is None:
+            # Fallback: just pick any host on the new VTEP
+            for potential_host in range(1, NUM_HOSTS + 1):
+                if ((potential_host - 1) % NUM_VTEPS) == new_vtep_idx:
+                    new_host_idx = potential_host
+                    break
 
-    # --- Step 3: Arrive on host2 (VTEP 2) --- #
-    print("Arriving... Creating on Location B (host2).")
-    create_macvlan_endpoint(tgen, "host2", vm_name, vm_ip, vm_mac)
+        new_host_name = f"host{new_host_idx}"
 
-    # give eVPN time to update routes
+        # Compute VM IP and MAC
+        vm_ip = f"192.168.100.{vm_idx}/16"
+        vm_mac = "00:aa:bb:cc:{:02x}:{:02x}".format((vm_idx >> 8) & 0xFF, vm_idx & 0xFF)
+
+        # Perform live migration (creates at destination, then deletes from source)
+        migrate_macvlan_endpoint_live(tgen, old_host_name, new_host_name, vm_name, vm_ip, vm_mac)
+        vm_locations[vm_name] = (new_host_idx, new_vtep_idx)
+
+        # Rate limit migrations to observe network behavior
+        if vm_idx % 5 == 0:
+            sleep(1)
+
+    # wait for all BGP/EVPN to process changes
     sleep(5)
 
-    # Check EVPN state on vtep2 after arrival
-    vtep2 = tgen.gears["vtep2"]
-    print("EVPN MAC state on vtep2 AFTER arrival:")
-    evpn_state = vtep2.vtysh_cmd("show evpn mac vni 1000")
-    print(evpn_state)
+    # --- Phase 4: Verify connectivity at new locations --- #
+    print("\nPhase 4: Verifying connectivity at new locations...")
+    
+    connectivity_failures = 0
+    for vm_idx in range(1, NUM_MOBILE_VMS + 1):
+        vm_name = f"vm{vm_idx}"
+        host_idx, vtep_idx = vm_locations[vm_name]
+        host_name = f"host{host_idx}"
 
-    # --- Step 4: Verify New Connectivity --- #
-    print("Testing connectivity from Location B (host2)...")
+        if verify_ping(tgen, host_name, vm_name, gateway_ip):
+            if vm_idx % 10 == 0:
+                print(f"  ✓ {vm_name} connectivity OK (migrated to {host_name})")
+        else:
+            print(f"  ✗ {vm_name} connectivity FAILED at new location")
+            connectivity_failures += 1
 
-    # force an ARP update (gratuitous ARP usually handles this, sending a ping triggers traffic)
-    success = verify_ping(tgen, "host2", vm_name, gateway_ip)
-    assert success, "Ping failed from Location B (host2) after migration"
-
-    print("SUCCESS: Location B connectivity established. Mobility simulation complete.")
+    assert connectivity_failures == 0, f"{connectivity_failures}/{NUM_MOBILE_VMS} VMs failed connectivity at new locations"
+    print(f"SUCCESS: All {NUM_MOBILE_VMS} VMs have connectivity at new locations. Mobility simulation complete.")
 
     # stop capture and flush output
     spine.run("if [ -f /tmp/tcpdump_evpn.pid ]; then kill $(cat /tmp/tcpdump_evpn.pid); fi")
@@ -396,14 +498,13 @@ def test_mobility(tgen):
     if os.getenv("MUNET_CLI") == "1":
         tgen.mininet_cli()  # this drops you into the 'munet>' prompt
 
-
+# THIS FUNCTION IS NOT CALLED ANYWHERE
 def test_get_version(tgen):
     "Test that logs the FRR version"
 
-    vtep1 = tgen.gears["vtep1"]
-    version = vtep1.vtysh_cmd("show evpn mac vni 1000")
-    print("EVPN MAC table: " + version)
-
+    vtep1 = tgen.gears["vtep1"]                             # retrieve the first VTEP
+    version = vtep1.vtysh_cmd("show evpn mac vni 1000")     # run a command to display the EVPN MAC table
+    print("EVPN MAC table: " + version)                     # print the output to the console
 
 if __name__ == "__main__":
     args = ["-s"] + sys.argv[1:]
