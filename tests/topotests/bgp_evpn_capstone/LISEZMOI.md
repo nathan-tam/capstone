@@ -53,6 +53,32 @@ Each host is configured with:
 - Unique IP and MAC addresses computed from host ID
 - Connection to a single VTEP (for simplicity in this test)
 
+#### MAC Address Generation (VMs)
+Mobile VMs are assigned unique MAC addresses using the following formula:
+```python
+vm_mac = "00:aa:bb:cc:{:02x}:{:02x}".format((vm_idx >> 8) & 0xFF, vm_idx & 0xFF)
+```
+
+**Where `vm_idx` is the VM index number** (1 through 128 in this test). For example, when deploying the first VM, `vm_idx = 1`; when deploying the 100th VM, `vm_idx = 100`.
+
+**How it works:**
+- **Fixed prefix**: `00:aa:bb:cc` 
+- **Upper byte**: `(vm_idx >> 8) & 0xFF` extracts bits 8-15 of vm_idx
+  - Right-shifts by 8 bits (divides by 256)
+  - Masks to keep only the lowest 8 bits
+- **Lower byte**: `vm_idx & 0xFF` extracts bits 0-7 of vm_idx
+  - Masks to keep only the lowest 8 bits
+
+**Examples:**
+| VM Name | vm_idx | Upper Byte | Lower Byte | Final MAC |
+|---------|--------|-----------|-----------|-----------|
+| vm1     | 1      | 0x00      | 0x01      | `00:aa:bb:cc:00:01` |
+| vm100   | 100    | 0x00      | 0x64      | `00:aa:bb:cc:00:64` |
+| vm128   | 128    | 0x00      | 0x80      | `00:aa:bb:cc:00:80` |
+| vm256   | 256    | 0x01      | 0x00      | `00:aa:bb:cc:01:00` |
+
+This encodes the VM index into the last two MAC bytes, ensuring each VM gets a unique, deterministic MAC address based on its number.
+
 #### Simulation
 Mobile VMs are simulated using **MACVLAN interfaces**:
 - Created on top of the host's bonded interface

@@ -33,6 +33,7 @@ sys.path.append(os.path.join(CWD, "../"))
 from lib import topotest
 from lib.topogen import Topogen, TopoRouter, get_topogen
 from lib.topolog import logger
+import debug_tools  # contains debugging functions, in case we need them
 
 # pytest module level markers
 pytestmark = [
@@ -339,75 +340,90 @@ def test_mobility(tgen):
     """
     Simulates 128 VMs moving between 4 VTEPs (via 4 hosts) to establish a baseline for 
     network traffic measurements. This creates high control plane stress by simulating
-    live VM migrations (vMotion/container failover).
+    live VM migrations.
 
-    Test Flow:
+    Steps:
     1. Deploy 128 VMs distributed across 4 hosts (one per VTEP)
     2. Verify connectivity from initial locations
-    3. Live-migrate each VM to a different VTEP (creates brief MAC duplicates)
+    3. Live-migrate each VM to a different VTEP (creates a brief MAC duplicates)
     4. Verify connectivity at new locations
     5. Capture BGP packet data during migrations
     """
 
-    # If any router has previously failed in another test, skip this one.
-    if tgen.routers_have_failure():
-        pytest.skip(f"skipped because of previous test failure\n {tgen.errors}")
+    # anycast gateway
+    gateway_ip = "192.168.0.250"
 
-    gateway_ip = "192.168.0.250"   # anycast Gateway
-
-    # start our packet capturing
+    #####################################################
+    # SECTION: Packet Capture Setup
+    #####################################################
     print("\nStarting Packet Capturing on spine1...")
-    spine = tgen.gears["spine1"]
-    pcap_dir = os.path.join(tgen.logdir, "spine1")
-    pcap_file = os.path.join(pcap_dir, "evpn_mobility.pcap")
-    spine.run("mkdir -p {}".format(pcap_dir))
-    # capture on spine for BGP (TCP/179). Use full flags so tcpdump
-    # runs detached and writes immediately (-s 0). Save pid for cleanup.
+    
+    spine = tgen.gears["spine1"]                                # retrieve spine1 to execute commands on
+    pcap_dir = os.path.join(tgen.logdir, "spine1")              # stores .pcap files in test's log directory
+    pcap_file = os.path.join(pcap_dir, "evpn_mobility.pcap")    # file to store captured packets
+    spine.run("mkdir -p {}".format(pcap_dir))                   # creates the directory if it doesn't exist
+    
+    # run tcpdump
     spine.run(
+        # runs detached and writes immediately (-s 0). save pid for cleanup
         "tcpdump -nni any -s 0 -w {} port 179 & echo $! > /tmp/tcpdump_evpn.pid".format(
             pcap_file
         ),
         stdout=None,
     )
 
-    # give tcpdump a moment to start
-    sleep(1)
+    sleep(1)    # give tcpdump a moment to start (necessary?)
 
+    #####################################################
+    # SECTION: Mobility Simulation
+    #####################################################
     print("\n=== Starting Mobility Simulation Test with {} VMs ===\n".format(NUM_MOBILE_VMS))
 
-    # Keep track of VM locations for migration
-    vm_locations = {}  # {vm_name: (current_host, current_vtep_idx)}
+    # create a dictionary to track VM locations. {vm_name: (current_host, current_vtep_idx)}
+    vm_locations = {}
 
-    # --- Phase 1: Deploy VMs on initial hosts --- #
-    print(f"Phase 1: Deploying {NUM_MOBILE_VMS} VMs on initial hosts...")
+    # --- Phase 1: deploy VMs on initial hosts --- #
+    print(f"Phase 1: Deploying {NUM_MOBILE_VMS} VMs on hosts...")
     
+    # configure addressing
     for vm_idx in range(1, NUM_MOBILE_VMS + 1):
+        # VM naming scheme is vm1, vm2, ..., vm128
         vm_name = f"vm{vm_idx}"
-        # Use 192.168.100.x for mobile VMs (can handle up to 254 VMs)
+        
+        # use 192.168.100.x for mobile VMs (can handle up to 254 VMs)
         vm_ip = f"192.168.100.{vm_idx}/16"
+        
+        # we use bit shifting to generate MAC addresses. sorry.
         vm_mac = "00:aa:bb:cc:{:02x}:{:02x}".format((vm_idx >> 8) & 0xFF, vm_idx & 0xFF)
 
-        # Distribute VMs round-robin across hosts (32 VMs per host with 128 VMs / 4 hosts)
+        # distribute VMs round-robin across hosts (32 VMs per host with 128 VMs / 4 hosts)
         host_idx = ((vm_idx - 1) % NUM_HOSTS) + 1
         host_name = f"host{host_idx}"
         
-        # Determine which VTEP this host is connected to
+        # determine which VTEP this host is connected to
         vtep_idx = (host_idx - 1) % NUM_VTEPS
 
+        # create the MACVLAN endpoint to simulate the VM
         create_macvlan_endpoint(tgen, host_name, vm_name, vm_ip, vm_mac)
+        
+        # add the VM to tracking dictionary
         vm_locations[vm_name] = (host_idx, vtep_idx)
 
-        # give BGP/EVPN a moment to advertise between VMs
+        # triggers every 5 VMs. adds a 1-second pause to give BGP/EVPN time to advertise
         if vm_idx % 5 == 0:
+            # give BGP/EVPN a moment to advertise between VMs
             sleep(1)
 
-    # wait for all BGP/EVPN to stabilize
+    # wait for BGP/EVPN to stabilize
     sleep(3)
 
-    # --- Phase 2: Verify initial connectivity --- #
+    # --- Phase 2: verify initial connectivity --- #
     print("\nPhase 2: Verifying connectivity from initial locations...")
+    print("\nThis will take a while...make a coffee, get a snack!")
     
     connectivity_failures = 0
+
+    # we ping all 128 VMs, printing success for every 10th VM
     for vm_idx in range(1, NUM_MOBILE_VMS + 1):
         vm_name = f"vm{vm_idx}"
         host_idx, vtep_idx = vm_locations[vm_name]
@@ -415,9 +431,9 @@ def test_mobility(tgen):
 
         if verify_ping(tgen, host_name, vm_name, gateway_ip):
             if vm_idx % 10 == 0:
-                print(f"  ✓ {vm_name} connectivity OK (on {host_name})")
+                print(f"{vm_name} connectivity OK (on {host_name})")
         else:
-            print(f"  ✗ {vm_name} connectivity FAILED")
+            print(f"{vm_name} connectivity FAILED")
             connectivity_failures += 1
 
     if connectivity_failures > 0:
@@ -426,17 +442,17 @@ def test_mobility(tgen):
         print(f"SUCCESS: All {NUM_MOBILE_VMS} VMs have connectivity from initial locations")
 
     # --- Phase 3: Migrate VMs to different VTEPs --- #
-    print(f"\nPhase 3: Live-migrating {NUM_MOBILE_VMS} VMs to different locations...")
+    print(f"\nPhase 3: Moving {NUM_MOBILE_VMS} VMs to different locations...")
     print("(Creating at destination while source exists, then cleaning up source)")
     
     for vm_idx in range(1, NUM_MOBILE_VMS + 1):
         vm_name = f"vm{vm_idx}"
         
-        # Get current location
+        # get current location
         old_host_idx, old_vtep_idx = vm_locations[vm_name]
         old_host_name = f"host{old_host_idx}"
         
-        # Compute new location on a different VTEP
+        # compute new location on a different VTEP
         new_vtep_idx = (old_vtep_idx + 1) % NUM_VTEPS
         
         # Find a host on the new VTEP
@@ -497,14 +513,6 @@ def test_mobility(tgen):
     # run test with MUNET_CLI=1 to drop into CLI after test completes
     if os.getenv("MUNET_CLI") == "1":
         tgen.mininet_cli()  # this drops you into the 'munet>' prompt
-
-# THIS FUNCTION IS NOT CALLED ANYWHERE
-def test_get_version(tgen):
-    "Test that logs the FRR version"
-
-    vtep1 = tgen.gears["vtep1"]                             # retrieve the first VTEP
-    version = vtep1.vtysh_cmd("show evpn mac vni 1000")     # run a command to display the EVPN MAC table
-    print("EVPN MAC table: " + version)                     # print the output to the console
 
 if __name__ == "__main__":
     args = ["-s"] + sys.argv[1:]
