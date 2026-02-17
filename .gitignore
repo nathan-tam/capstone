@@ -114,7 +114,6 @@ refix
 .vscode
 .kitchen
 .emacs.desktop*
-.DS_Store
 
 /test-suite.log
 pceplib/test/*.log
