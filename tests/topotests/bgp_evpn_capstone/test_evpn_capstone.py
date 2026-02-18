@@ -47,8 +47,8 @@ pytestmark = [
 #####################################################
 
 # Test scaling parameters
-NUM_VTEPS = 4
-NUM_HOSTS = 4  # One host per VTEP for VM mobility testing
+NUM_VTEPS = 6
+NUM_HOSTS = 6  # One host per VTEP for VM mobility testing
 NUM_MOBILE_VMS = 128  # Number of VMs that will move around
 
 vtep_ips = {
@@ -56,8 +56,18 @@ vtep_ips = {
     for i in range(1, NUM_VTEPS + 1)
 }
 
+def compute_svi_ip(vtep_index):
+    # Keep legacy SVI assignment for vtep1-vtep5.
+    if vtep_index <= 5:
+        return f"192.168.0.{250 + vtep_index}"
+
+    # For additional VTEPs, avoid invalid octets and avoid 192.168.1-12.x
+    # used by underlay links in this topology.
+    return f"192.168.200.{vtep_index - 5}"
+
+
 svi_ips = {
-    f"vtep{i}": f"192.168.0.{250+i}" 
+    f"vtep{i}": compute_svi_ip(i)
     for i in range(1, NUM_VTEPS + 1)
 }
 
@@ -330,12 +340,12 @@ def migrate_macvlan_endpoint_live(tgen, old_host_name, new_host_name, vm_name, i
 
 def test_mobility(tgen):
     """
-    Simulates 128 VMs moving between 4 VTEPs (via 4 hosts) to establish a baseline for 
+    Simulates 128 VMs moving between VTEPs (via one host per VTEP) to establish a baseline for 
     network traffic measurements. This creates high control plane stress by simulating
     live VM migrations.
 
     Steps:
-    1. Deploy 128 VMs distributed across 4 hosts (one per VTEP)
+    1. Deploy 128 VMs distributed across hosts (one per VTEP)
     2. Verify connectivity from initial locations
     3. Live-migrate each VM to a different VTEP (creates a brief MAC duplicates)
     4. Verify connectivity at new locations
@@ -388,7 +398,7 @@ def test_mobility(tgen):
         # we use bit shifting to generate MAC addresses. sorry.
         vm_mac = "00:aa:bb:cc:{:02x}:{:02x}".format((vm_idx >> 8) & 0xFF, vm_idx & 0xFF)
 
-        # distribute VMs round-robin across hosts (32 VMs per host with 128 VMs / 4 hosts)
+        # distribute VMs round-robin across hosts
         host_idx = ((vm_idx - 1) % NUM_HOSTS) + 1
         host_name = f"host{host_idx}"
         
