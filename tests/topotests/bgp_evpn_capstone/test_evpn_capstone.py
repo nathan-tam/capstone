@@ -14,13 +14,8 @@ test_evpn_capstone.py: Testing EVPN with L2VNI
 """
 
 import os
-import re
 import sys
-import pdb
-import random
-import json
-from functools import partial
-from time import sleep, time
+from time import sleep
 import platform
 import pytest
 
@@ -31,10 +26,8 @@ sys.path.append(os.path.join(CWD, "../"))
 # pylint: disable=C0413
 # Import topogen and topotest helpers
 from lib import topotest
-from lib.topogen import Topogen, TopoRouter, get_topogen
-from lib.topolog import logger
-from debug_tools import verify_ping, verify_initial_connectivity, verify_post_migration_connectivity
-import debug_tools  # contains debugging functions, in case we need them
+from lib.topogen import Topogen, TopoRouter
+from debug_tools import verify_ping
 
 # pytest module level markers
 pytestmark = [
@@ -63,6 +56,13 @@ CONTROLLER_ENDPOINT_MAC = "00:aa:bb:dd:00:01"
 # Toggle controller-to-VM ping verification during phase 2 and phase 4.
 # Set to False to skip controller reachability sweeps while keeping mobility logic unchanged.
 ENABLE_CONTROLLER_PING_CHECKS = False
+
+# Duration (seconds) to keep duplicate-MAC overlap during live migration.
+# Can be overridden with env var MOBILITY_OVERLAP_SECONDS.
+try:
+    MOBILITY_OVERLAP_SECONDS = max(0.0, float(os.getenv("MOBILITY_OVERLAP_SECONDS", "0.2")))
+except ValueError:
+    MOBILITY_OVERLAP_SECONDS = 0.1
 
 vtep_ips = {
     f"vtep{i}": f"{10*i}.{10*i}.{10*i}.{10*i}" 
@@ -372,7 +372,7 @@ def migrate_macvlan_endpoint_live(tgen, old_host_name, new_host_name, vm_name, i
     create_macvlan_endpoint(tgen, new_host_name, vm_name, ip, mac)
     
     # Small delay to let BGP detect the duplicate
-    sleep(0.5)
+    sleep(MOBILITY_OVERLAP_SECONDS)
     
     # Step 2: Delete from source (now both VTEPs had it briefly)
     delete_macvlan_endpoint(tgen, old_host_name, vm_name)
@@ -479,6 +479,7 @@ def test_mobility(tgen):
     # SECTION: Packet Capture Setup
     #####################################################
     print("\nStarting Packet Capturing on spine1...")
+    print(f"Using mobility overlap timer: {MOBILITY_OVERLAP_SECONDS:.3f}s")
     
     spine = tgen.gears["spine1"]                                # Run packet capture on spine1.
     pcap_dir = os.path.join(tgen.logdir, "spine1")              # Store output in the test log directory.
