@@ -15,6 +15,7 @@ test_evpn_capstone.py: Testing EVPN with L2VNI
 
 import os
 import sys
+import shlex
 from time import sleep
 import platform
 import pytest
@@ -63,6 +64,54 @@ try:
     MOBILITY_OVERLAP_SECONDS = max(0.0, float(os.getenv("MOBILITY_OVERLAP_SECONDS", "0.2")))
 except ValueError:
     MOBILITY_OVERLAP_SECONDS = 0.1
+
+# Auto-threshold for post-test pcap packet counting.
+# Packet counting is skipped when a pcap exceeds this size (bytes).
+try:
+    PCAP_PACKET_COUNT_MAX_BYTES = max(
+        0, int(os.getenv("PCAP_PACKET_COUNT_MAX_BYTES", str(1024 * 1024 * 1024)))
+    )
+except ValueError:
+    PCAP_PACKET_COUNT_MAX_BYTES = 1024 * 1024 * 1024
+
+
+def format_binary_size(num_bytes):
+    """Format bytes into human-readable binary units (KiB, MiB, GiB...)."""
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    size = float(max(0, num_bytes))
+    unit_idx = 0
+    while size >= 1024.0 and unit_idx < len(units) - 1:
+        size /= 1024.0
+        unit_idx += 1
+    if unit_idx == 0:
+        return f"{int(size)} {units[unit_idx]}"
+    return f"{size:.1f} {units[unit_idx]}"
+
+
+def get_file_size_bytes(node, file_path):
+    """Return file size in bytes as string, or 'missing' if file does not exist."""
+    path = shlex.quote(file_path)
+    return node.run(
+        "if [ -f {0} ]; then stat -c%s {0}; else echo missing; fi".format(path)
+    ).strip()
+
+
+def get_pcap_packet_count(node, file_path, max_bytes):
+    """Return packet count, or 'skipped'/'missing' based on file state and threshold."""
+    path = shlex.quote(file_path)
+    return node.run(
+        "if [ -f {0} ]; then size=$(stat -c%s {0}); if [ \"$size\" -le {1} ]; then tcpdump -nr {0} 2>/dev/null | wc -l; else echo skipped; fi; else echo missing; fi".format(
+            path,
+            max_bytes,
+        )
+    ).strip()
+
+
+def format_packet_count(packet_count_value, max_bytes):
+    """Format packet-count summary value for reporting."""
+    if packet_count_value == "skipped":
+        return f"skipped(>{format_binary_size(max_bytes)})"
+    return packet_count_value
 
 vtep_ips = {
     f"vtep{i}": f"{10*i}.{10*i}.{10*i}.{10*i}" 
@@ -478,22 +527,44 @@ def test_mobility(tgen):
     #####################################################
     # SECTION: Packet Capture Setup
     #####################################################
-    print("\nStarting Packet Capturing on spine1...")
+    print("\nStarting Packet Capturing on spine1 and controller VTEP...")
     print(f"Using mobility overlap timer: {MOBILITY_OVERLAP_SECONDS:.3f}s")
+    print(f"Packet count threshold: {format_binary_size(PCAP_PACKET_COUNT_MAX_BYTES)}")
     
     spine = tgen.gears["spine1"]                                # Run packet capture on spine1.
     pcap_dir = os.path.join(tgen.logdir, "spine1")              # Store output in the test log directory.
     pcap_file = os.path.join(pcap_dir, "evpn_mobility.pcap")    # Output file for captured packets.
-    spine.run("mkdir -p {}".format(pcap_dir))                   # Ensure output directory exists.
+    spine.run("mkdir -p {}".format(shlex.quote(pcap_dir)))      # Ensure output directory exists.
+
+    controller_vtep = tgen.gears[controller_vtep_name]
+    controller_pcap_dir = os.path.join(tgen.logdir, controller_vtep_name)
+    controller_pcap_file = os.path.join(
+        controller_pcap_dir,
+        "evpn_controller_mobility.pcap",
+    )
+    controller_vtep.run("mkdir -p {}".format(shlex.quote(controller_pcap_dir)))
+
+    print(f"spine capture file: {pcap_file}")
+    print(f"controller capture file: {controller_pcap_file}")
     
     # Start tcpdump.
     spine.run(
         # Run detached with full packet capture; save PID for cleanup.
         "tcpdump -nni any -s 0 -w {} port 179 & echo $! > /tmp/tcpdump_evpn.pid".format(
-            pcap_file
+            shlex.quote(pcap_file)
         ),
         stdout=None,
     )
+
+    # Capture controller-VTEP view of mobility-related control/data-plane traffic.
+    controller_vtep.run(
+        "tcpdump -nni any -s 0 -w {} 'tcp port 179 or udp port 4789 or arp' & echo $! > /tmp/tcpdump_evpn_controller.pid".format(
+            shlex.quote(controller_pcap_file)
+        ),
+        stdout=None,
+    )
+
+    print("tcpdump started on spine1 and controller VTEP")
 
     sleep(1)    # Give tcpdump a brief startup window before mobility begins.
 
@@ -614,7 +685,54 @@ def test_mobility(tgen):
     finally:
         # Stop capture and flush output.
         spine.run("if [ -f /tmp/tcpdump_evpn.pid ]; then kill $(cat /tmp/tcpdump_evpn.pid); fi")
+        controller_vtep.run(
+            "if [ -f /tmp/tcpdump_evpn_controller.pid ]; then kill $(cat /tmp/tcpdump_evpn_controller.pid); fi"
+        )
         spine.run("sleep 1")
+
+        spine_pcap_size_bytes = get_file_size_bytes(spine, pcap_file)
+        controller_pcap_size_bytes = get_file_size_bytes(
+            controller_vtep,
+            controller_pcap_file,
+        )
+        spine_pcap_packets = get_pcap_packet_count(
+            spine,
+            pcap_file,
+            PCAP_PACKET_COUNT_MAX_BYTES,
+        )
+        controller_pcap_packets = get_pcap_packet_count(
+            controller_vtep,
+            controller_pcap_file,
+            PCAP_PACKET_COUNT_MAX_BYTES,
+        )
+
+        spine_pcap_size_display = (
+            "missing"
+            if spine_pcap_size_bytes == "missing"
+            else format_binary_size(int(spine_pcap_size_bytes))
+        )
+        controller_pcap_size_display = (
+            "missing"
+            if controller_pcap_size_bytes == "missing"
+            else format_binary_size(int(controller_pcap_size_bytes))
+        )
+
+        spine_pcap_packets_display = format_packet_count(
+            spine_pcap_packets,
+            PCAP_PACKET_COUNT_MAX_BYTES,
+        )
+        controller_pcap_packets_display = format_packet_count(
+            controller_pcap_packets,
+            PCAP_PACKET_COUNT_MAX_BYTES,
+        )
+
+        print("Packet captures saved:")
+        print(
+            f"  spine1: {pcap_file} ({spine_pcap_size_display}, packets={spine_pcap_packets_display})"
+        )
+        print(
+            f"  {controller_vtep_name}: {controller_pcap_file} ({controller_pcap_size_display}, packets={controller_pcap_packets_display})"
+        )
 
         # Remove controller endpoint to keep test namespace clean.
         delete_macvlan_endpoint_if_exists(
