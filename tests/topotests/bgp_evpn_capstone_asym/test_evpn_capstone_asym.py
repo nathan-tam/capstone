@@ -737,7 +737,7 @@ def test_mobility(tgen):
     #####################################################
     # SECTION: Packet Capture Setup
     #####################################################
-    print("\nStarting packet capture on spine1 and controller VTEP...")
+    print("\nStarting packet capture on spine1, vtep2, and controller VTEP...")
     print(f"Using mobility overlap timer: {MOBILITY_OVERLAP_SECONDS:.3f}s")
     print(f"Migration batch size: {MIGRATION_BATCH_SIZE}")
     print(f"Batch settle timer: {MIGRATION_BATCH_SETTLE_SECONDS:.3f}s")
@@ -746,18 +746,24 @@ def test_mobility(tgen):
     
     spine = tgen.gears["spine1"]                                # Run packet capture on spine1.
     pcap_dir = os.path.join(tgen.logdir, "spine1")              # Store output in the test log directory.
-    pcap_file = os.path.join(pcap_dir, "evpn_mobility.pcap")    # Output file for captured packets.
+    pcap_file = os.path.join(pcap_dir, "spine1_evpn_mobility.pcap")    # Output file for captured packets.
     spine.run("mkdir -p {}".format(shlex.quote(pcap_dir)))      # Ensure output directory exists.
 
     controller_vtep = tgen.gears[controller_vtep_name]
     controller_pcap_dir = os.path.join(tgen.logdir, controller_vtep_name)
     controller_pcap_file = os.path.join(
         controller_pcap_dir,
-        "evpn_controller_mobility.pcap",
+        f"{controller_vtep_name}_evpn_controller_mobility.pcap",
     )
     controller_vtep.run("mkdir -p {}".format(shlex.quote(controller_pcap_dir)))
 
+    vtep2 = tgen.gears["vtep2"]
+    vtep2_pcap_dir = os.path.join(tgen.logdir, "vtep2")
+    vtep2_pcap_file = os.path.join(vtep2_pcap_dir, "vtep2_evpn_mobility.pcap")
+    vtep2.run("mkdir -p {}".format(shlex.quote(vtep2_pcap_dir)))
+
     print(f"spine capture file: {pcap_file}")
+    print(f"vtep2 capture file: {vtep2_pcap_file}")
     print(f"controller capture file: {controller_pcap_file}")
     
     # Start tcpdump.
@@ -769,15 +775,22 @@ def test_mobility(tgen):
         stdout=None,
     )
 
-    # Capture controller-VTEP view of mobility-related control/data-plane traffic.
+    vtep2.run(
+        "tcpdump -nni any -s 0 -w {} port 179 & echo $! > /tmp/tcpdump_evpn_vtep2.pid".format(
+            shlex.quote(vtep2_pcap_file)
+        ),
+        stdout=None,
+    )
+
+    # Capture controller-VTEP view of mobility-related control-plane traffic.
     controller_vtep.run(
-        "tcpdump -nni any -s 0 -w {} 'tcp port 179 or udp port 4789 or arp' & echo $! > /tmp/tcpdump_evpn_controller.pid".format(
+        "tcpdump -nni any -s 0 -w {} port 179 & echo $! > /tmp/tcpdump_evpn_controller.pid".format(
             shlex.quote(controller_pcap_file)
         ),
         stdout=None,
     )
 
-    print("tcpdump started on spine1 and controller VTEP")
+    print("tcpdump started on spine1, vtep2, and controller VTEP")
 
     sleep(1)    # Give tcpdump a brief startup window before mobility begins.
 
@@ -887,6 +900,9 @@ def test_mobility(tgen):
     finally:
         # Stop capture and flush output.
         spine.run("if [ -f /tmp/tcpdump_evpn.pid ]; then kill $(cat /tmp/tcpdump_evpn.pid); fi")
+        vtep2.run(
+            "if [ -f /tmp/tcpdump_evpn_vtep2.pid ]; then kill $(cat /tmp/tcpdump_evpn_vtep2.pid); fi"
+        )
         controller_vtep.run(
             "if [ -f /tmp/tcpdump_evpn_controller.pid ]; then kill $(cat /tmp/tcpdump_evpn_controller.pid); fi"
         )
@@ -897,6 +913,10 @@ def test_mobility(tgen):
             controller_vtep,
             controller_pcap_file,
         )
+        vtep2_pcap_size_bytes = get_file_size_bytes(
+            vtep2,
+            vtep2_pcap_file,
+        )
         spine_pcap_packets = get_pcap_packet_count(
             spine,
             pcap_file,
@@ -905,6 +925,11 @@ def test_mobility(tgen):
         controller_pcap_packets = get_pcap_packet_count(
             controller_vtep,
             controller_pcap_file,
+            PCAP_PACKET_COUNT_MAX_BYTES,
+        )
+        vtep2_pcap_packets = get_pcap_packet_count(
+            vtep2,
+            vtep2_pcap_file,
             PCAP_PACKET_COUNT_MAX_BYTES,
         )
 
@@ -918,6 +943,11 @@ def test_mobility(tgen):
             if controller_pcap_size_bytes == "missing"
             else format_binary_size(int(controller_pcap_size_bytes))
         )
+        vtep2_pcap_size_display = (
+            "missing"
+            if vtep2_pcap_size_bytes == "missing"
+            else format_binary_size(int(vtep2_pcap_size_bytes))
+        )
 
         spine_pcap_packets_display = format_packet_count(
             spine_pcap_packets,
@@ -927,10 +957,17 @@ def test_mobility(tgen):
             controller_pcap_packets,
             PCAP_PACKET_COUNT_MAX_BYTES,
         )
+        vtep2_pcap_packets_display = format_packet_count(
+            vtep2_pcap_packets,
+            PCAP_PACKET_COUNT_MAX_BYTES,
+        )
 
         print("Packet captures saved:")
         print(
             f"  spine1: {pcap_file} ({spine_pcap_size_display}, packets={spine_pcap_packets_display})"
+        )
+        print(
+            f"  vtep2: {vtep2_pcap_file} ({vtep2_pcap_size_display}, packets={vtep2_pcap_packets_display})"
         )
         print(
             f"  {controller_vtep_name}: {controller_pcap_file} ({controller_pcap_size_display}, packets={controller_pcap_packets_display})"
