@@ -9,9 +9,7 @@
 # Network Device Education Foundation, Inc. ("NetDEF")
 #
 
-"""
-test_evpn_capstone.py: Testing EVPN with L2VNI
-"""
+"""Topotest for EVPN L2VNI endpoint mobility with a static controller endpoint."""
 
 import os
 import sys
@@ -37,7 +35,7 @@ pytestmark = [
 ]
 
 #####################################################
-##   Configuration Functions
+##   Configuration
 #####################################################
 
 # Test scaling parameters
@@ -279,13 +277,14 @@ def get_mobility_vtep_indices():
 
 
 def get_mobility_host_indices():
-    # Mobility-eligible hosts are hosts connected to mobility-eligible VTEPs.
+    # Mobility-eligible hosts are attached to mobility-eligible VTEPs.
     mobility_vtep_indices = set(get_mobility_vtep_indices())
     return [
         host_idx
         for host_idx in range(1, NUM_HOSTS + 1)
         if host_to_vtep_index(host_idx) in mobility_vtep_indices
     ]
+
 
 def compute_svi_ip(vtep_index):
     # Keep legacy SVI assignment for vtep1-vtep5.
@@ -332,18 +331,14 @@ def config_bond(node, bond_name, bond_members, bond_ad_sys_mac, br):
         node.run("/sbin/bridge vlan add vid 1000 untagged pvid dev %s" % bond_name)
 
 
-def config_l2vni(vtep_name, node, svi_ip, vtep_ip):
+def config_l2vni(node, svi_ip, vtep_ip):
     """
-    Create a VxLAN device for VNI 1000 and add it to the bridge.
-    VLAN-1000 is mapped to VNI-1000.
+    Configure Linux bridge/VXLAN dataplane for L2VNI 1000 on one VTEP.
 
-    Creates a Linux bridge br1000.
-    Assigns VLAN 1000 IP addresses to the bridge (SVI).
-    Creates a VXLAN interface for VNI 1000 tied to the VTEP IP.
-    Adds the VXLAN interface to the bridge.
-    Sets MAC learning on VXLAN in the Linux bridge dataplane.
-    Configures VLAN 1000 on the VXLAN interface.
-    Brings interfaces up to start forwarding traffic.
+    - Create bridge br1000 and assign SVI + anycast gateway addresses
+    - Create vxlan device vni1000 bound to the VTEP source IP
+    - Attach vni1000 to br1000 with VLAN 1000 membership
+    - Bring all interfaces up
     """
     # Create a bridge br1000 and assign SVI IP
     node.run("ip link add br1000 type bridge")
@@ -367,17 +362,20 @@ def config_l2vni(vtep_name, node, svi_ip, vtep_ip):
     node.run("/sbin/bridge vlan add vid 1000 untagged pvid dev vni1000")
 
 
-def config_vtep(vtep_name, vtep, vtep_ip, svi_pip):
+def config_vtep(vtep_name, vtep, vtep_ip, svi_ip):
     """
-    Create bond + VXLAN bridge configuration on a VTEP (EVPN PE).
+    Configure host-facing bond plus VXLAN bridge on one EVPN VTEP.
     """
 
     # Create L2VNI, bridge, and associated SVI.
-    config_l2vni(vtep_name, vtep, svi_pip, vtep_ip)
+    config_l2vni(vtep, svi_ip, vtep_ip)
 
     # Create host bond and add it to the bridge.
-    vtep_id = vtep_name.split("vtep")[1]
-    sys_mac = "44:38:39:ff:ff:0" + vtep_id
+    vtep_index = int(vtep_name.split("vtep")[1])
+    sys_mac = "44:38:39:ff:{:02x}:{:02x}".format(
+        (vtep_index >> 8) & 0xFF,
+        vtep_index & 0xFF,
+    )
 
     bond_member = vtep_name + "-eth2"
     config_bond(vtep, "hostbond1", [bond_member], sys_mac, "br1000")
@@ -413,11 +411,10 @@ def compute_host_ip_mac(host_name):
 
 def config_host(host_name, host):
     """
-    Create the host-facing bond used for multihoming tests.
+    Configure the host-side bonded uplink used to attach endpoints.
     """
 
-    bond_members = []
-    bond_members.append(host_name + "-eth0")
+    bond_members = [host_name + "-eth0"]
 
     # Name of the bonded interface to be created on the host
     bond_name = "vtepbond"
@@ -440,9 +437,8 @@ def config_hosts(tgen, hosts):
 ##   Network Topology Definition
 #####################################################
 
-# Function passed to Topogen to create the topology.
 def build_topo(tgen):
-    "Build function"
+    """Build a 2-spine, N-VTEP, N-host Clos-style topology."""
 
     # Create spines
     spine1 = tgen.add_router("spine1")
@@ -477,10 +473,9 @@ def build_topo(tgen):
         tgen.add_link(vtep, host)
 
 
-# Setup/teardown fixture that creates the topology and starts daemons.
 @pytest.fixture(scope="module")
 def tgen(request):
-    "Setup/Teardown the environment and provide tgen argument to tests"
+    """Set up topology/configuration and provide Topogen to tests."""
 
     # Instantiate and start the topology.
     tgen = Topogen(build_topo, request.module.__name__)
@@ -526,46 +521,38 @@ def skip_on_failure(tgen):
 #####################################################
 
 def create_macvlan_endpoint(tgen, host_name, vm_name, ip, mac):
-    """Create a MACVLAN interface on a host to simulate a VM/container."""
+    """Create one MACVLAN endpoint on a host namespace."""
     host = tgen.gears[host_name]
     print(f"Creating MACVLAN {vm_name} on {host_name} with IP {ip} MAC {mac}")
 
-    # 1. Add link of type macvlan linked to the physical bond (vtepbond)
-    host.run(f"ip link add link vtepbond name {vm_name} type macvlan mode bridge")
+    def run_checked(command, error_message):
+        result = host.run(f"{command} >/dev/null 2>&1 && echo ok || echo failed").strip()
+        assert result == "ok", error_message
 
-    # 2. Set MAC address
-    host.run(f"ip link set dev {vm_name} address {mac}")
-
-    # 3. Set IP address
-    host.run(f"ip addr add {ip} dev {vm_name}")
-
-    # 4. Bring up
-    host.run(f"ip link set dev {vm_name} up")
+    run_checked(
+        f"ip link add link vtepbond name {vm_name} type macvlan mode bridge",
+        f"failed to create MACVLAN {vm_name} on {host_name}",
+    )
+    run_checked(
+        f"ip link set dev {vm_name} address {mac}",
+        f"failed to set MAC for {vm_name} on {host_name}",
+    )
+    run_checked(
+        f"ip addr add {ip} dev {vm_name}",
+        f"failed to set IP for {vm_name} on {host_name}",
+    )
+    run_checked(
+        f"ip link set dev {vm_name} up",
+        f"failed to bring up {vm_name} on {host_name}",
+    )
 
 
 def delete_macvlan_endpoint(tgen, host_name, vm_name):
-    """Delete a MACVLAN interface to simulate VM departure."""
+    """Delete one MACVLAN endpoint from a host namespace."""
     host = tgen.gears[host_name]
     print(f"Deleting MACVLAN {vm_name} from {host_name}")
-    host.run(f"ip link del {vm_name}")
-
-
-def migrate_macvlan_endpoint_live(tgen, old_host_name, new_host_name, vm_name, ip, mac):
-    """
-    Live migration of MACVLAN interface: Creates at destination while source still exists,
-    then deletes from source. This creates a brief moment where the same MAC is on two VTEPs,
-    simulating vMotion/container failover and stressing the control plane.
-    """
-    print(f"Live migrating MACVLAN {vm_name} from {old_host_name} to {new_host_name}")
-    
-    # Step 1: Create at destination (while source still has the VM)
-    create_macvlan_endpoint(tgen, new_host_name, vm_name, ip, mac)
-    
-    # Small delay to let BGP detect the duplicate
-    sleep(MOBILITY_OVERLAP_SECONDS)
-    
-    # Step 2: Delete from source (now both VTEPs had it briefly)
-    delete_macvlan_endpoint(tgen, old_host_name, vm_name)
+    result = host.run(f"ip link del {vm_name} >/dev/null 2>&1 && echo ok || echo failed").strip()
+    assert result == "ok", f"failed to delete MACVLAN {vm_name} from {host_name}"
 
 
 def create_controller_endpoint(tgen):
@@ -593,7 +580,7 @@ def delete_macvlan_endpoint_if_exists(tgen, host_name, vm_name):
 
 
 def verify_controller_to_vm_connectivity(tgen, num_mobile_vms, phase_name):
-    """Verify static controller endpoint can ping all mobile VM IPs."""
+    """Verify the static controller endpoint can ping each mobile VM IP."""
     connectivity_failures = 0
     progress_interval = 10
 
@@ -633,12 +620,10 @@ def verify_controller_to_vm_connectivity(tgen, num_mobile_vms, phase_name):
 
 def test_mobility(tgen):
     """
-    Simulates 128 VMs moving between mobility-eligible VTEPs (via one host per VTEP)
-    while keeping controller VTEPs static in the control plane.
+    Simulate endpoint mobility across VTEPs while keeping controller VTEPs static.
 
-    This establishes a baseline for
-    network traffic measurements. This creates high control plane stress by simulating
-    live VM migrations.
+    This test drives repeated duplicate-MAC windows (destination create before
+    source delete) to stress EVPN control-plane convergence.
 
     Steps:
     1. Deploy 128 VMs distributed across hosts (one per VTEP)
@@ -647,9 +632,6 @@ def test_mobility(tgen):
     4. Verify controller endpoint can still reach all VM IPs after migration
     5. Capture BGP packet data during migrations
     """
-
-    # Anycast gateway.
-    gateway_ip = "192.168.0.250"
 
     controller_host_idx = int(CONTROLLER_ENDPOINT_HOST.replace("host", ""))
     controller_vtep_name = vtep_name_from_index(host_to_vtep_index(controller_host_idx))
@@ -668,7 +650,7 @@ def test_mobility(tgen):
     #####################################################
     # SECTION: Packet Capture Setup
     #####################################################
-    print("\nStarting Packet Capturing on spine1 and controller VTEP...")
+    print("\nStarting packet capture on spine1 and controller VTEP...")
     print(f"Using mobility overlap timer: {MOBILITY_OVERLAP_SECONDS:.3f}s")
     print(f"Migration batch size: {MIGRATION_BATCH_SIZE}")
     print(f"Batch settle timer: {MIGRATION_BATCH_SETTLE_SECONDS:.3f}s")
@@ -727,7 +709,7 @@ def test_mobility(tgen):
         # --- Phase 1: deploy VMs on initial hosts --- #
         print(f"Phase 1: Deploying {NUM_MOBILE_VMS} VMs on hosts...")
         
-        # Configure addressing.
+        # Create mobile endpoints and record initial placement.
         for vm_idx in range(1, NUM_MOBILE_VMS + 1):
             # VM naming scheme: vm1, vm2, ..., vm128.
             vm_name = f"vm{vm_idx}"
@@ -761,13 +743,11 @@ def test_mobility(tgen):
 
         # --- Phase 2: verify initial connectivity --- #
         print("\nPhase 2: Verifying connectivity from initial locations...")
-        print("This will take a while...make a coffee, get a snack!\n")
+        print("Running controller-to-VM reachability sweep...\n")
         if ENABLE_CONTROLLER_PING_CHECKS:
             verify_controller_to_vm_connectivity(tgen, NUM_MOBILE_VMS, "initial deployment")
         else:
             print("Controller ping checks are disabled (initial deployment phase).")
-        # Intentionally disabled for now:
-        # verify_initial_connectivity(tgen, vm_locations, gateway_ip, NUM_MOBILE_VMS)
 
         # --- Phase 3: migrate VMs to different VTEPs --- #
         print(f"\nPhase 3: Moving {NUM_MOBILE_VMS} VMs to different locations...")
@@ -811,8 +791,6 @@ def test_mobility(tgen):
             verify_controller_to_vm_connectivity(tgen, NUM_MOBILE_VMS, "post migration")
         else:
             print("Controller ping checks are disabled (post migration phase).")
-        # Intentionally disabled for now:
-        # verify_post_migration_connectivity(tgen, vm_locations, gateway_ip, NUM_MOBILE_VMS)
     finally:
         # Stop capture and flush output.
         spine.run("if [ -f /tmp/tcpdump_evpn.pid ]; then kill $(cat /tmp/tcpdump_evpn.pid); fi")
