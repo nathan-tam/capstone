@@ -1,215 +1,144 @@
 # EVPN Capstone Test Suite
 
-Apologies for further ballooning the administrative burden by creating a second README file. I will attempt to refrain from speedrunning bureaucratic paralysis. The purpose of this document is to be a single-location on the technical aspects of this test. Also be aware that a majority of this document was generated from dialogue with Copilot. Excerise skepticism, especially since Nathan was the one who edited it afterwards. As a funny side note, it did the orignal generation in French because of the file name. Anyway, an overview:
+This document describes the current implementation of the EVPN mobility topotest in this directory.
 
-> This test suite validates BGP EVPN (Ethernet VPN) functionality with L2VNI (Layer 2 VNI) in FRRouting (FRR). It simulates a large-scale data center environment with multiple VTEPs (VXLAN Tunnel Endpoints), hosts, and mobile VMs to stress-test the EVPN control plane during VM mobility events. The primary goal is to measure and validate network behavior when virtual machines migrate across different VTEPs in an EVPN fabric.
+> The test validates BGP EVPN (L2VNI) behavior during repeated MAC mobility events. It creates a small Clos fabric, deploys many MACVLAN-based endpoints, migrates them between VTEPs, and captures BGP control-plane traffic for analysis.
+
+## Current Scope
+
+- 6 VTEPs (EVPN leaf nodes)
+- 2 spine routers
+- 6 hosts (one host connected to each VTEP)
+- 128 mobile VM endpoints (simulated MACVLAN interfaces)
 
 ## Network Topology
 
-- 4 VTEPs (VXLAN Tunnel Endpoints) - acting as EVPN-PE routers
-- 2 Spine Routers - providing full-mesh connectivity
-- 128 Hosts - distributed round-robin across VTEPs
-- 20 Mobile VMs - simulated using MACVLAN interfaces
-
 Each VTEP connects to:
 
-- Both spine routers
-- About 32 hosts via bonded interfaces
+- spine1
+- spine2
+- one host-facing bond (`hostbond1`)
 
 ### Topology Structure
 
 ```text
-        spine1 -------- spine2
-         /  |  \         /  |  \
-       /    |    \     /    |    \
-   vtep1  vtep2  vtep3  vtep4  ...
-     |      |      |      |
-   hosts  hosts  hosts  hosts
-  (32ea) (32ea) (32ea) (32ea)
+                     spine1 ---------------- spine2
+                    /   |   \   \   \         /   |   \   \   \
+                   /    |    \   \   \       /    |    \   \   \
+               vtep1 vtep2 vtep3 vtep4 vtep5 vtep6
+                 |     |     |     |     |     |
+               host1 host2 host3 host4 host5 host6
 ```
 
 ### Addressing Scheme
 
-- VTEP Loopbacks: `{10*i}.{10*i}.{10*i}.{10*i}` (e.g., vtep1 = 10.10.10.10)
-- SVI IPs: `192.168.0.{250+i}` (e.g., vtep1 = 192.168.0.251)
-- Anycast Gateway: `192.168.0.250` (shared across all VTEPs)
-- Host IPs: `192.168.0.1` through `192.168.0.127`, then `192.168.1.1+`
-- Mobile VM IPs: `192.168.100.1` through `192.168.100.20`
+- VTEP BGP router-id values (from per-VTEP BGP config): `192.168.100.15` to `192.168.100.20` (`vtep1`..`vtep6`)
+- VTEP VXLAN local source IPs (set by test setup code): `{10*i}.{10*i}.{10*i}.{10*i}` for VTEP `i`
+- SVI IPs:
+  - `vtep1`..`vtep5`: `192.168.0.251` through `192.168.0.255`
+  - `vtep6+`: `192.168.200.x` (introduced to avoid invalid `.256` and avoid overlap with underlay subnets)
+- Anycast gateway on all VTEPs: `192.168.0.250/16`
+- Host IPs (`host1`..`host6` in current scale): `192.168.0.1/16` through `192.168.0.6/16`
+- Mobile VM IPs: `192.168.100.1/16` through `192.168.100.128/16`
 
 ---
 
 ## How It Works
 
-### Bridge Setup
+### Bridge + VXLAN Setup
 
-- A Linux bridge `br1000` for VLAN 1000
-- SVI (Switch Virtual Interface) with both unique IP and anycast gateway IP
-- ARP accept enabled for anycast gateway functionality
+- Linux bridge `br1000` is created per VTEP
+- Per-VTEP SVI IP and anycast gateway IP are added to `br1000`
+- VXLAN interface `vni1000` (UDP 4789, VNI 1000) is attached to the bridge
+- ARP accept is enabled on `br1000`
+- Bridge VLAN 1000 membership is configured for host bond and VNI interfaces
+- Current runtime behavior sets bridge learning **on** for `vni1000` (`bridge link set dev vni1000 learning on`)
 
-### VXLAN Configuration
+### Host and VM Modeling
 
-- VXLAN interface `vni1000` for VNI 1000
-- Local VTEP IP as source
-- UDP port 4789 (standard VXLAN port)
-- Learning disabled (BGP EVPN handles MAC learning)
-
-### Bonding
-
-- 802.3ad LACP bonds for multi-homing
-- Layer 3+4 hash policy for traffic distribution
-- Connected to hosts via `hostbond1`
-
-### Host Configuration
-
-Each host is configured with:
-
-- An 802.3ad bonded interface (`vtepbond`)
-- Unique IP and MAC addresses computed from host ID
-- Connection to a single VTEP (for simplicity in this test)
-
-### MAC Address Generation (VMs)
-
-Mobile VMs are assigned unique MAC addresses using the following formula:
+- Each host uses bond `vtepbond`
+- Mobile endpoints are MACVLAN interfaces (`mode bridge`) created on `vtepbond`
+- VM naming: `vm1`..`vm128`
+- VM MAC formula:
 
 ```python
 vm_mac = "00:aa:bb:cc:{:02x}:{:02x}".format((vm_idx >> 8) & 0xFF, vm_idx & 0xFF)
 ```
 
-Where `vm_idx` is the VM index number (1 through 128 in this test). For example, when deploying the first VM, `vm_idx = 1`; when deploying the 100th VM, `vm_idx = 100`.
-
-**How it works:**
-
-- **Fixed prefix**: `00:aa:bb:cc`
-- **Upper byte**: `(vm_idx >> 8) & 0xFF` extracts bits 8-15 of vm_idx
-  - Right-shifts by 8 bits (divides by 256)
-  - Masks to keep only the lowest 8 bits
-- **Lower byte**: `vm_idx & 0xFF` extracts bits 0-7 of vm_idx
-  - Masks to keep only the lowest 8 bits
-
-**Examples:**
-
-| VM Name | vm_idx | Upper Byte | Lower Byte | Final MAC            |
-| ------- | ------ | ---------- | ---------- | -------------------- |
-| vm1     | 1      | 0x00       | 0x01       | `00:aa:bb:cc:00:01` |
-| vm100   | 100    | 0x00       | 0x64       | `00:aa:bb:cc:00:64` |
-| vm128   | 128    | 0x00       | 0x80       | `00:aa:bb:cc:00:80` |
-| vm256   | 256    | 0x01       | 0x00       | `00:aa:bb:cc:01:00` |
-
-This encodes the VM index into the last two MAC bytes, ensuring each VM gets a unique, deterministic MAC address based on its number.
-
-### Simulation
-
-Mobile VMs are simulated using **MACVLAN interfaces**:
-
-- Created on top of the host's bonded interface
-- Each VM gets its own IP and MAC address
-- MACVLAN mode: `bridge` (allows communication with host)
-
 ## Test Phases
+
+The test executes four phases in order:
 
 ### Phase 1: VM Deployment
 
-- Deploy 20 VMs across different hosts
-- VMs distributed round-robin across all 128 hosts
-- Small delays (every 5 VMs) to allow BGP convergence
-- Final 3-second stabilization period
+- Deploy 128 VM MACVLAN interfaces
+- Distribute round-robin across the 6 hosts
+- Pause every 5 VMs for control-plane settling
+- Final stabilization sleep
 
 ### Phase 2: Initial Connectivity Verification
 
-- Ping from each VM to the anycast gateway (192.168.0.250)
-- Validates that all VMs have Layer 3 connectivity
-- Reports any connectivity failures
+- Test code prints the phase banner
+- The connectivity helper exists, but the call is currently commented out
 
 ### Phase 3: Live Migration
 
-This is the **core test phase**:
-
 For each VM:
 
-1. Identify current location (old host on old VTEP)
-2. Select new location (host on different VTEP)
-3. **Live migration sequence**:
-   - Create MACVLAN on destination host (VM now exists in two places)
-   - Wait 500ms (stresses control plane with duplicate MAC)
-   - Delete MACVLAN from source host
-4. Update VM location tracking
-
-The migration creates a brief period where the same MAC exists on two VTEPs, forcing BGP EVPN to:
-
-- Detect the duplicate MAC
-- Update route advertisements
-- Withdraw old routes
-- Establish new forwarding paths
+1. Determine current host/VTEP
+2. Select host on next VTEP (`(old_vtep + 1) % NUM_VTEPS`)
+3. Live move sequence:
+   - Create VM MACVLAN on destination host
+   - Sleep 500ms (intentional duplicate MAC window)
+   - Delete VM MACVLAN from source host
 
 ### Phase 4: Post-Migration Verification
 
-- Ping from each VM at its **new location** to the gateway
-- Validates that EVPN successfully updated all forwarding tables
-- Asserts zero connectivity failures (test fails if any VM can't reach gateway)
+- Test code prints the phase banner
+- The post-migration connectivity helper exists, but the call is currently commented out
 
 ## Packet Capture
 
-The test captures BGP traffic on spine1 during the entire test:
+- Capture runs on `spine1`.
+- Captures TCP/179 traffic to `{logdir}/spine1/evpn_mobility.pcap`
+- Intended for offline EVPN/BGP update analysis.
 
-- Captures all TCP port 179 traffic (BGP)
-- Stores to: `{logdir}/spine1/evpn_mobility.pcap`
-- Allows post-test analysis of EVPN route updates
-
-This PCAP file can be analyzed to:
-
-- Count BGP UPDATE messages
-- Measure convergence times
-- Identify route flapping
-- Study MAC mobility signaling
-
-## BGP EVPN
-
-### MAC Mobility
-
-- When a VM moves, EVPN Type-2 routes (MAC/IP advertisement) are updated
-- Old VTEP withdraws the route
-- New VTEP advertises the route with updated next-hop
-- All other VTEPs update their forwarding tables
-
-### Anycast Gateway
-
-- All VTEPs share the same default gateway IP (192.168.0.250)
-- VMs can migrate without changing their gateway configuration
-- Distributed anycast routing for optimal traffic flow
+Note: capture output depends on `tcpdump` starting successfully in the runtime environment.
 
 ## Configuration Files
 
-The test expects per-router configuration in subdirectories:
+Per-node files expected by test loader:
 
-- `{routername}/zebra.conf` - Interface and routing configuration
-- `{routername}/evpn.conf` - BGP EVPN-specific configuration
+- `{routername}/zebra.conf`
+- `{routername}/evpn.conf`
 
-For example:
+Current topology includes:
 
-- `vtep1/zebra.conf` - VTEP1's Zebra daemon config
-- `vtep1/evpn.conf` - VTEP1's BGP EVPN config
-- `spine1/zebra.conf` - Spine1's routing config
-- etc.
+- `spine1`, `spine2`
+- `vtep1`..`vtep6`
+- `host1`..`host6`
 
-## Success Criteria
+## Success Criteria (Current Behavior)
 
-The test passes when:
+- Topology and daemons start successfully
+- Mobility loop executes for all 128 VMs without fatal test exceptions
+- Packet capture file is expected to be produced when `tcpdump` starts successfully
 
-1. TO-DO: FILL THIS SECTION OUT.
+If connectivity checks are uncommented, additional criteria become:
+
+- 0 initial connectivity failures
+- 0 post-migration connectivity failures
 
 ## Metrics Measured
 
-While the test primarily validates functional correctness, it provides data for:
-
-- Control plane stress: 20 simultaneous MAC mobility events
-- Convergence time: Time from VM creation/migration to connectivity
-- Scale validation: 128 hosts + 20 mobile VMs across 4 VTEPs
-- BGP update volume: Captured in PCAP for offline analysis
+- Control-plane stress from 128 sequential mobility events
+- BGP update behavior during duplicate-MAC and move windows
+- Scale validation at current lab topology size (6 VTEPs, 6 hosts)
 
 ## Debugging
 
-1. Check EVPN status: `show evpn mac vni 1000` on any VTEP
-2. BGP routes: `show bgp l2vpn evpn` to see advertised routes
-3. Bridge MACs: `bridge fdb show` to see learned MAC addresses
-4. Connectivity issues: Check that VNIs match and VXLAN is up
-5. PCAP analysis: Use Wireshark to examine `evpn_mobility.pcap`
+1. `show evpn mac vni 1000`
+2. `show bgp l2vpn evpn`
+3. `bridge fdb show`
+4. Validate VNI/VXLAN interface state and BGP neighbor state
+5. Inspect `evpn_mobility.pcap` in Wireshark/tshark

@@ -61,8 +61,8 @@ def compute_svi_ip(vtep_index):
     if vtep_index <= 5:
         return f"192.168.0.{250 + vtep_index}"
 
-    # For additional VTEPs, avoid invalid octets and avoid 192.168.1-12.x
-    # used by underlay links in this topology.
+    # For additional VTEPs, avoid invalid octets (e.g., .256) and keep SVI
+    # space separate from underlay ranges currently used in this topology.
     return f"192.168.200.{vtep_index - 5}"
 
 
@@ -73,7 +73,7 @@ svi_ips = {
 
 def config_bond(node, bond_name, bond_members, bond_ad_sys_mac, br):
     """
-    Used to setup bonds on the VTEPs and hosts for MH
+    Set up Linux bonds on VTEPs and hosts for multihoming.
     """
     node.run("ip link add dev %s type bond mode 802.3ad" % bond_name)
     node.run("ip link set dev %s type bond lacp_rate 1" % bond_name)
@@ -91,7 +91,7 @@ def config_bond(node, bond_name, bond_members, bond_ad_sys_mac, br):
 
     node.run("ip link set dev %s up" % bond_name)
 
-    # if bridge is specified add the bond as a bridge member
+    # If a bridge is specified, add the bond as a bridge member.
     if br:
         node.run(" ip link set dev %s master %s" % (bond_name, br))
         node.run("/sbin/bridge link set dev %s priority 8" % bond_name)
@@ -110,7 +110,7 @@ def config_l2vni(vtep_name, node, svi_ip, vtep_ip):
     Assigns VLAN 1000 IP addresses to the bridge (SVI).
     Creates a VXLAN interface for VNI 1000 tied to the VTEP IP.
     Adds the VXLAN interface to the bridge.
-    Disables MAC learning on VXLAN (because BGP EVPN handles MAC learning).
+    Sets MAC learning on VXLAN in the Linux bridge dataplane.
     Configures VLAN 1000 on the VXLAN interface.
     Brings interfaces up to start forwarding traffic.
     """
@@ -138,13 +138,13 @@ def config_l2vni(vtep_name, node, svi_ip, vtep_ip):
 
 def config_vtep(vtep_name, vtep, vtep_ip, svi_pip):
     """
-    Create the bond/vxlan-bridge on the VTEP which acts as EVPN-PE
+    Create bond + VXLAN bridge configuration on a VTEP (EVPN PE).
     """
 
-    # create l2vni, bridge and associated SVI
+    # Create L2VNI, bridge, and associated SVI.
     config_l2vni(vtep_name, vtep, svi_pip, vtep_ip)
 
-    # create hostbonds and add them to the bridge
+    # Create host bond and add it to the bridge.
     vtep_id = vtep_name.split("vtep")[1]
     sys_mac = "44:38:39:ff:ff:0" + vtep_id
 
@@ -182,7 +182,7 @@ def compute_host_ip_mac(host_name):
 
 def config_host(host_name, host):
     """
-    Create the bond on host nodes for MH
+    Create the host-facing bond used for multihoming tests.
     """
 
     bond_members = []
@@ -209,7 +209,7 @@ def config_hosts(tgen, hosts):
 ##   Network Topology Definition
 #####################################################
 
-# Function we pass to Topogen to create the topology
+# Function passed to Topogen to create the topology.
 def build_topo(tgen):
     "Build function"
 
@@ -224,34 +224,34 @@ def build_topo(tgen):
         vtep = tgen.add_router(vtep_name)
         vteps.append(vtep_name)
         
-        # Create links between spine1 and this VTEP
+        # Connect this VTEP to spine1.
         tgen.add_link(spine1, vtep)
         
-        # Create links between spine2 and this VTEP
+        # Connect this VTEP to spine2.
         tgen.add_link(spine2, vtep)
 
-    # Create hosts and distribute them across VTEPs
+    # Create hosts and distribute them across VTEPs.
     hosts = []
     for i in range(1, NUM_HOSTS + 1):
         host_name = f"host{i}"
         host = tgen.add_router(host_name)
         hosts.append(host_name)
         
-        # Distribute hosts across VTEPs in round-robin fashion
+        # Distribute hosts across VTEPs in round-robin fashion.
         vtep_idx = (i - 1) % NUM_VTEPS
         vtep_name = f"vtep{vtep_idx + 1}"
         vtep = tgen.gears[vtep_name]
         
-        # Create link between this VTEP and host
+        # Connect the selected VTEP to this host.
         tgen.add_link(vtep, host)
 
 
-# New form of setup/teardown using pytest fixture
+# Setup/teardown fixture that creates the topology and starts daemons.
 @pytest.fixture(scope="module")
 def tgen(request):
     "Setup/Teardown the environment and provide tgen argument to tests"
 
-    # This function initiates the topology build with Topogen...
+    # Instantiate and start the topology.
     tgen = Topogen(build_topo, request.module.__name__)
     tgen.start_topology()
 
@@ -283,7 +283,7 @@ def tgen(request):
     tgen.stop_topology()
 
 
-# Fixture that executes before each test
+# Skip subsequent tests if an earlier test caused router failures.
 @pytest.fixture(autouse=True)
 def skip_on_failure(tgen):
     if tgen.routers_have_failure():
@@ -295,7 +295,7 @@ def skip_on_failure(tgen):
 #####################################################
 
 def create_macvlan_endpoint(tgen, host_name, vm_name, ip, mac):
-    """Creates a MACVLAN interface on the specified host to simulate a VM/Container"""
+    """Create a MACVLAN interface on a host to simulate a VM/container."""
     host = tgen.gears[host_name]
     print(f"Creating MACVLAN {vm_name} on {host_name} with IP {ip} MAC {mac}")
 
@@ -313,7 +313,7 @@ def create_macvlan_endpoint(tgen, host_name, vm_name, ip, mac):
 
 
 def delete_macvlan_endpoint(tgen, host_name, vm_name):
-    """Deletes the MACVLAN interface to simulate VM departure"""
+    """Delete a MACVLAN interface to simulate VM departure."""
     host = tgen.gears[host_name]
     print(f"Deleting MACVLAN {vm_name} from {host_name}")
     host.run(f"ip link del {vm_name}")
@@ -347,12 +347,12 @@ def test_mobility(tgen):
     Steps:
     1. Deploy 128 VMs distributed across hosts (one per VTEP)
     2. Verify connectivity from initial locations
-    3. Live-migrate each VM to a different VTEP (creates a brief MAC duplicates)
+    3. Live-migrate each VM to a different VTEP (brief duplicate-MAC window)
     4. Verify connectivity at new locations
     5. Capture BGP packet data during migrations
     """
 
-    # anycast gateway
+    # Anycast gateway.
     gateway_ip = "192.168.0.250"
 
     #####################################################
@@ -360,82 +360,83 @@ def test_mobility(tgen):
     #####################################################
     print("\nStarting Packet Capturing on spine1...")
     
-    spine = tgen.gears["spine1"]                                # retrieve spine1 to execute commands on
-    pcap_dir = os.path.join(tgen.logdir, "spine1")              # stores .pcap files in test's log directory
-    pcap_file = os.path.join(pcap_dir, "evpn_mobility.pcap")    # file to store captured packets
-    spine.run("mkdir -p {}".format(pcap_dir))                   # creates the directory if it doesn't exist
+    spine = tgen.gears["spine1"]                                # Run packet capture on spine1.
+    pcap_dir = os.path.join(tgen.logdir, "spine1")              # Store output in the test log directory.
+    pcap_file = os.path.join(pcap_dir, "evpn_mobility.pcap")    # Output file for captured packets.
+    spine.run("mkdir -p {}".format(pcap_dir))                   # Ensure output directory exists.
     
-    # run tcpdump
+    # Start tcpdump.
     spine.run(
-        # runs detached and writes immediately (-s 0). save pid for cleanup
+        # Run detached with full packet capture; save PID for cleanup.
         "tcpdump -nni any -s 0 -w {} port 179 & echo $! > /tmp/tcpdump_evpn.pid".format(
             pcap_file
         ),
         stdout=None,
     )
 
-    sleep(1)    # give tcpdump a moment to start (necessary?)
+    sleep(1)    # Give tcpdump a brief startup window before mobility begins.
 
     #####################################################
     # SECTION: Mobility Simulation
     #####################################################
     print("\n=== Starting Mobility Simulation Test with {} VMs ===\n".format(NUM_MOBILE_VMS))
 
-    # create a dictionary to track VM locations. {vm_name: (current_host, current_vtep_idx)}
+    # Track VM locations as: {vm_name: (current_host, current_vtep_idx)}.
     vm_locations = {}
 
     # --- Phase 1: deploy VMs on initial hosts --- #
     print(f"Phase 1: Deploying {NUM_MOBILE_VMS} VMs on hosts...")
     
-    # configure addressing
+    # Configure addressing.
     for vm_idx in range(1, NUM_MOBILE_VMS + 1):
-        # VM naming scheme is vm1, vm2, ..., vm128
+        # VM naming scheme: vm1, vm2, ..., vm128.
         vm_name = f"vm{vm_idx}"
         
-        # use 192.168.100.x for mobile VMs (can handle up to 254 VMs)
+        # Use 192.168.100.x for mobile VMs (up to 254 VMs).
         vm_ip = f"192.168.100.{vm_idx}/16"
         
-        # we use bit shifting to generate MAC addresses. sorry.
+        # Generate a deterministic MAC from the VM index using bit shifts.
         vm_mac = "00:aa:bb:cc:{:02x}:{:02x}".format((vm_idx >> 8) & 0xFF, vm_idx & 0xFF)
 
         # distribute VMs round-robin across hosts
         host_idx = ((vm_idx - 1) % NUM_HOSTS) + 1
         host_name = f"host{host_idx}"
         
-        # determine which VTEP this host is connected to
+        # Determine which VTEP this host is connected to.
         vtep_idx = (host_idx - 1) % NUM_VTEPS
 
         # create the MACVLAN endpoint to simulate the VM
         create_macvlan_endpoint(tgen, host_name, vm_name, vm_ip, vm_mac)
         
-        # add the VM to tracking dictionary
+        # Add the VM to the tracking dictionary.
         vm_locations[vm_name] = (host_idx, vtep_idx)
 
-        # triggers every 5 VMs. adds a 1-second pause to give BGP/EVPN time to advertise
+        # Every 5 VMs, pause briefly to allow BGP/EVPN updates.
         if vm_idx % 5 == 0:
-            # give BGP/EVPN a moment to advertise between VMs
+            # Give BGP/EVPN a moment to advertise between VM additions.
             sleep(1)
 
-    # wait for BGP/EVPN to stabilize
+    # Wait for BGP/EVPN to stabilize.
     sleep(3)
 
     # --- Phase 2: verify initial connectivity --- #
     print("\nPhase 2: Verifying connectivity from initial locations...")
     print("This will take a while...make a coffee, get a snack!\n")
+    # Intentionally disabled for now:
     # verify_initial_connectivity(tgen, vm_locations, gateway_ip, NUM_MOBILE_VMS)
 
-    # --- Phase 3: Migrate VMs to different VTEPs --- #
+    # --- Phase 3: migrate VMs to different VTEPs --- #
     print(f"\nPhase 3: Moving {NUM_MOBILE_VMS} VMs to different locations...")
     print("(Creating at destination while source exists, then cleaning up source)")
     
     for vm_idx in range(1, NUM_MOBILE_VMS + 1):
         vm_name = f"vm{vm_idx}"
         
-        # get current location
+        # Get current location.
         old_host_idx, old_vtep_idx = vm_locations[vm_name]
         old_host_name = f"host{old_host_idx}"
         
-        # compute new location on a different VTEP
+        # Compute new location on a different VTEP.
         new_vtep_idx = (old_vtep_idx + 1) % NUM_VTEPS
         
         # Find a host on the new VTEP
@@ -447,7 +448,7 @@ def test_mobility(tgen):
                 break
         
         if new_host_idx is None:
-            # Fallback: just pick any host on the new VTEP
+            # Fallback: pick any host on the new VTEP.
             for potential_host in range(1, NUM_HOSTS + 1):
                 if ((potential_host - 1) % NUM_VTEPS) == new_vtep_idx:
                     new_host_idx = potential_host
@@ -459,26 +460,27 @@ def test_mobility(tgen):
         vm_ip = f"192.168.100.{vm_idx}/16"
         vm_mac = "00:aa:bb:cc:{:02x}:{:02x}".format((vm_idx >> 8) & 0xFF, vm_idx & 0xFF)
 
-        # Perform live migration (creates at destination, then deletes from source)
+        # Perform live migration (create at destination, then delete from source).
         migrate_macvlan_endpoint_live(tgen, old_host_name, new_host_name, vm_name, vm_ip, vm_mac)
         vm_locations[vm_name] = (new_host_idx, new_vtep_idx)
 
-        # Rate limit migrations to observe network behavior
+        # Rate-limit migrations to observe network behavior.
         if vm_idx % 5 == 0:
             sleep(1)
 
-    # wait for all BGP/EVPN to process changes
+    # Wait for all BGP/EVPN updates to process.
     sleep(5)
 
-    # --- Phase 4: Verify connectivity at new locations --- #
+    # --- Phase 4: verify connectivity at new locations --- #
     print("\nPhase 4: Verifying connectivity at new locations...")
+    # Intentionally disabled for now:
     # verify_post_migration_connectivity(tgen, vm_locations, gateway_ip, NUM_MOBILE_VMS)
 
-    # stop capture and flush output
+    # Stop capture and flush output.
     spine.run("if [ -f /tmp/tcpdump_evpn.pid ]; then kill $(cat /tmp/tcpdump_evpn.pid); fi")
     spine.run("sleep 1")
 
-    # run test with MUNET_CLI=1 to drop into CLI after test completes
+    # Run with MUNET_CLI=1 to drop into CLI after test completion.
     if os.getenv("MUNET_CLI") == "1":
         tgen.mininet_cli()  # this drops you into the 'munet>' prompt
 
