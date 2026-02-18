@@ -59,24 +59,24 @@ ENABLE_CONTROLLER_PING_CHECKS = False
 # Duration (seconds) to keep duplicate-MAC overlap during live migration.
 # Can be overridden with env var MOBILITY_OVERLAP_SECONDS.
 try:
-    MOBILITY_OVERLAP_SECONDS = max(0.0, float(os.getenv("MOBILITY_OVERLAP_SECONDS", "0.3")))
+    MOBILITY_OVERLAP_SECONDS = max(0.0, float(os.getenv("MOBILITY_OVERLAP_SECONDS", "0.2")))
 except ValueError:
-    MOBILITY_OVERLAP_SECONDS = 0.1
+    MOBILITY_OVERLAP_SECONDS = 0.2
 
 # Number of endpoints to move together during phase 3 migration.
 try:
-    MIGRATION_BATCH_SIZE = max(1, int(os.getenv("MIGRATION_BATCH_SIZE", "5")))
+    MIGRATION_BATCH_SIZE = max(1, int(os.getenv("MIGRATION_BATCH_SIZE", "1")))
 except ValueError:
-    MIGRATION_BATCH_SIZE = 5
+    MIGRATION_BATCH_SIZE = 1
 
 # Optional settle delay between migration batches.
 try:
     MIGRATION_BATCH_SETTLE_SECONDS = max(
         0.0,
-        float(os.getenv("MIGRATION_BATCH_SETTLE_SECONDS", "0.0")),
+        float(os.getenv("MIGRATION_BATCH_SETTLE_SECONDS", "0.2")),
     )
 except ValueError:
-    MIGRATION_BATCH_SETTLE_SECONDS = 0.0
+    MIGRATION_BATCH_SETTLE_SECONDS = 0.2
 
 # Safety mode: if batch destination creation partially fails, roll back already-created
 # destination endpoints in that batch before re-raising the error.
