@@ -1,7 +1,16 @@
 #!/usr/bin/env python
+# -*- coding: utf-8 eval: (blacken-mode 1) -*-
+# SPDX-License-Identifier: ISC
+#
+# test_evpn_capstone.py
+# Part of NetDEF Topology Tests
+#
+# Copyright (c) 2017 by
+# Network Device Education Foundation, Inc. ("NetDEF")
+#
 
 """
-test_evpn_capstone.py: Testing EVPN with L2VNI and L3VNI
+test_evpn_capstone.py: Testing EVPN with L2VNI
 """
 
 import os
@@ -52,9 +61,31 @@ ENABLE_CONTROLLER_PING_CHECKS = False
 # Duration (seconds) to keep duplicate-MAC overlap during live migration.
 # Can be overridden with env var MOBILITY_OVERLAP_SECONDS.
 try:
-    MOBILITY_OVERLAP_SECONDS = max(0.0, float(os.getenv("MOBILITY_OVERLAP_SECONDS", "0.2")))
+    MOBILITY_OVERLAP_SECONDS = max(0.0, float(os.getenv("MOBILITY_OVERLAP_SECONDS", "0.3")))
 except ValueError:
     MOBILITY_OVERLAP_SECONDS = 0.1
+
+# Number of endpoints to move together during phase 3 migration.
+try:
+    MIGRATION_BATCH_SIZE = max(1, int(os.getenv("MIGRATION_BATCH_SIZE", "5")))
+except ValueError:
+    MIGRATION_BATCH_SIZE = 5
+
+# Optional settle delay between migration batches.
+try:
+    MIGRATION_BATCH_SETTLE_SECONDS = max(
+        0.0,
+        float(os.getenv("MIGRATION_BATCH_SETTLE_SECONDS", "0.0")),
+    )
+except ValueError:
+    MIGRATION_BATCH_SETTLE_SECONDS = 0.0
+
+# Safety mode: if batch destination creation partially fails, roll back already-created
+# destination endpoints in that batch before re-raising the error.
+ENABLE_MIGRATION_BATCH_SAFETY_ROLLBACK = (
+    os.getenv("ENABLE_MIGRATION_BATCH_SAFETY_ROLLBACK", "true").strip().lower()
+    not in {"0", "false", "no", "off"}
+)
 
 # Auto-threshold for post-test pcap packet counting.
 # Packet counting is skipped when a pcap exceeds this size (bytes).
@@ -103,6 +134,125 @@ def format_packet_count(packet_count_value, max_bytes):
     if packet_count_value == "skipped":
         return f"skipped(>{format_binary_size(max_bytes)})"
     return packet_count_value
+
+
+def macvlan_endpoint_exists(tgen, host_name, vm_name):
+    """Return True when endpoint interface exists on the host."""
+    host = tgen.gears[host_name]
+    vm_name_quoted = shlex.quote(vm_name)
+    result = host.run(
+        "ip link show {0} >/dev/null 2>&1 && echo present || echo missing".format(
+            vm_name_quoted
+        )
+    ).strip()
+    return result == "present"
+
+
+def build_vm_migration_plan(vm_idx, vm_locations, mobility_vtep_indices, mobility_host_indices):
+    """Compute source/destination placement and addressing for one VM migration."""
+    vm_name = f"vm{vm_idx}"
+
+    # Current location.
+    old_host_idx, old_vtep_idx = vm_locations[vm_name]
+    old_host_name = f"host{old_host_idx}"
+
+    # Destination is the next mobility-eligible VTEP.
+    current_pos = mobility_vtep_indices.index(old_vtep_idx)
+    new_vtep_idx = mobility_vtep_indices[(current_pos + 1) % len(mobility_vtep_indices)]
+
+    # Prefer a different host than source, then fallback to any host on destination VTEP.
+    new_host_idx = None
+    for potential_host in mobility_host_indices:
+        if host_to_vtep_index(potential_host) == new_vtep_idx and potential_host != old_host_idx:
+            new_host_idx = potential_host
+            break
+
+    if new_host_idx is None:
+        for potential_host in mobility_host_indices:
+            if host_to_vtep_index(potential_host) == new_vtep_idx:
+                new_host_idx = potential_host
+                break
+
+    assert new_host_idx is not None, f"No destination host found for VTEP index {new_vtep_idx}"
+
+    vm_ip = f"192.168.100.{vm_idx}/16"
+    vm_mac = "00:aa:bb:cc:{:02x}:{:02x}".format((vm_idx >> 8) & 0xFF, vm_idx & 0xFF)
+
+    return {
+        "vm_name": vm_name,
+        "old_host_name": old_host_name,
+        "new_host_name": f"host{new_host_idx}",
+        "new_host_idx": new_host_idx,
+        "new_vtep_idx": new_vtep_idx,
+        "vm_ip": vm_ip,
+        "vm_mac": vm_mac,
+    }
+
+
+def migrate_macvlan_endpoints_live_batch(tgen, migration_batch):
+    """Move a batch by creating all destinations first, then deleting all sources."""
+    created_destinations = []
+
+    try:
+        for migration in migration_batch:
+            create_macvlan_endpoint(
+                tgen,
+                migration["new_host_name"],
+                migration["vm_name"],
+                migration["vm_ip"],
+                migration["vm_mac"],
+            )
+
+            if not macvlan_endpoint_exists(
+                tgen,
+                migration["new_host_name"],
+                migration["vm_name"],
+            ):
+                raise AssertionError(
+                    f"destination endpoint {migration['vm_name']} missing on {migration['new_host_name']} after create"
+                )
+
+            created_destinations.append(
+                (migration["new_host_name"], migration["vm_name"])
+            )
+    except Exception as error:
+        if ENABLE_MIGRATION_BATCH_SAFETY_ROLLBACK and created_destinations:
+            print(
+                "WARNING: batch migration destination create failed; "
+                f"rolling back {len(created_destinations)} created endpoints before aborting. "
+                f"Error: {error}"
+            )
+            for host_name, vm_name in reversed(created_destinations):
+                delete_macvlan_endpoint_if_exists(tgen, host_name, vm_name)
+        else:
+            print(
+                "WARNING: batch migration destination create failed with no rollback applied. "
+                f"Error: {error}"
+            )
+        raise
+
+    sleep(MOBILITY_OVERLAP_SECONDS)
+
+    for migration in migration_batch:
+        delete_macvlan_endpoint(
+            tgen,
+            migration["old_host_name"],
+            migration["vm_name"],
+        )
+        if macvlan_endpoint_exists(
+            tgen,
+            migration["old_host_name"],
+            migration["vm_name"],
+        ):
+            print(
+                "WARNING: source endpoint still present after delete; forcing cleanup for "
+                f"{migration['vm_name']} on {migration['old_host_name']}"
+            )
+            delete_macvlan_endpoint_if_exists(
+                tgen,
+                migration["old_host_name"],
+                migration["vm_name"],
+            )
 
 vtep_ips = {
     f"vtep{i}": f"{10*i}.{10*i}.{10*i}.{10*i}" 
@@ -161,7 +311,9 @@ def config_bond(node, bond_name, bond_members, bond_ad_sys_mac, br):
     node.run("ip link set dev %s type bond miimon 100" % bond_name)
     node.run("ip link set dev %s type bond xmit_hash_policy layer3+4" % bond_name)
     node.run("ip link set dev %s type bond min_links 1" % bond_name)
-    node.run("ip link set dev %s type bond ad_actor_system %s" % (bond_name, bond_ad_sys_mac))
+    node.run(
+        "ip link set dev %s type bond ad_actor_system %s" % (bond_name, bond_ad_sys_mac)
+    )
 
     for bond_member in bond_members:
         node.run("ip link set dev %s down" % bond_member)
@@ -195,14 +347,17 @@ def config_l2vni(vtep_name, node, svi_ip, vtep_ip):
     """
     # Create a bridge br1000 and assign SVI IP
     node.run("ip link add br1000 type bridge")
-    node.run("ip link set br1000 master vrf500")
-    node.run("ip addr add %s/24 dev br1000" % svi_ip)
-    node.run("ip addr add 45.0.0.1/24 dev br1000") # Anycast GW
+    node.run("ip addr add %s/16 dev br1000" % svi_ip)
+    # Anycast gateway address for hosts to reach
+    node.run("ip addr add 192.168.0.250/16 dev br1000")
     node.run("/sbin/sysctl net.ipv4.conf.br1000.arp_accept=1")
 
-    node.run("ip link add vni1000 type vxlan local %s dstport 4789 id 1000 nolearning" % vtep_ip)
+    node.run(
+        "ip link add vni1000 type vxlan local %s dstport 4789 id 1000"
+        % vtep_ip
+    )
     node.run("ip link set vni1000 master br1000 addrgenmode none")
-    node.run("/sbin/bridge link set dev vni1000 learning off")
+    node.run("/sbin/bridge link set dev vni1000 learning on")
     node.run("ip link set vni1000 up")
     node.run("ip link set br1000 up")
 
@@ -224,33 +379,37 @@ def config_vtep(vtep_name, vtep, vtep_ip, svi_pip):
     vtep_id = vtep_name.split("vtep")[1]
     sys_mac = "44:38:39:ff:ff:0" + vtep_id
 
-    bond_member = tor_name + "-eth2"
-    
-    # --- FIXED LOGIC FROM ORIGINAL FILE ---
-    # Assign hostbond to correct bridge based on rack/subnet
-    if "torm11" in tor_name:
-        config_bond(tor, "hostbond1", [bond_member], sys_mac, "br1000")
-    elif "torm12" in tor_name:
-        config_bond(tor, "hostbond1", [bond_member], sys_mac, "br1000")
-    elif "torm21" in tor_name:  # <--- FIXED TYPO (Was torm12)
-        config_bond(tor, "hostbond1", [bond_member], sys_mac, "br1000")
-    else:
-        # torm22 uses VNI 2000
-        config_bond(tor, "hostbond1", [bond_member], sys_mac, "br2000")
+    bond_member = vtep_name + "-eth2"
+    config_bond(vtep, "hostbond1", [bond_member], sys_mac, "br1000")
 
-def config_tors(tgen, tors):
-    for tor_name in tors:
-        tor = tgen.gears[tor_name]
-        config_tor(tor_name, tor, tor_ips.get(tor_name), svi_ips.get(tor_name))
+
+def config_vteps(tgen, vteps):
+    for vtep_name in vteps:
+        vtep = tgen.gears[vtep_name]
+        config_vtep(vtep_name, vtep, vtep_ips.get(vtep_name), svi_ips.get(vtep_name))
+
 
 def compute_host_ip_mac(host_name):
-    host_id = host_name.split("hostd")[1]
-    if host_name == "hostd22":
-        host_ip = "20.0.0." + host_id + "/24"
+    host_id = int(host_name.split("host")[1])
+    # Simple sequential IP: host1 = 192.168.0.1, host2 = 192.168.0.2, etc.
+    # (avoiding .0 as network and .250+ for gateways/SVIs)
+    if host_id <= 127:
+        # Use 192.168.0.1 to 192.168.0.127
+        fourth_octet = host_id
+        third_octet = 0
     else:
-        host_ip = "45.0.0." + host_id + "/24"
-    host_mac = "00:00:00:00:00:" + host_id
+        # For hosts > 127, use 192.168.1.x, 192.168.2.x, etc.
+        offset = host_id - 128
+        third_octet = 1 + (offset // 254)
+        fourth_octet = 1 + (offset % 254)
+    
+    host_ip = f"192.168.{third_octet}.{fourth_octet}/16"
+    # For MAC addresses, simple encoding: 00:00:00:xx:yy:zz
+    host_mac = "00:00:00:{:02x}:{:02x}:{:02x}".format(
+        (host_id >> 16) & 0xFF, (host_id >> 8) & 0xFF, host_id & 0xFF
+    )
     return host_ip, host_mac
+
 
 def config_host(host_name, host):
     """
@@ -265,8 +424,11 @@ def config_host(host_name, host):
     config_bond(host, bond_name, bond_members, "00:00:00:00:00:00", None)
 
     host_ip, host_mac = compute_host_ip_mac(host_name)
+
+    # Assign the computed IP address and MAC address to the bonded interface
     host.run("ip addr add %s dev %s" % (host_ip, bond_name))
     host.run("ip link set dev %s address %s" % (bond_name, host_mac))
+
 
 def config_hosts(tgen, hosts):
     for host_name in hosts:
@@ -329,20 +491,26 @@ def tgen(request):
         tgen.errors = "kernel 4.19 needed for multihoming tests"
         pytest.skip(tgen.errors)
 
-    tors = ["torm11", "torm12", "torm21", "torm22"]
-    config_tors(tgen, tors)
+    # Configure all VTEPs
+    vteps = [f"vtep{i}" for i in range(1, NUM_VTEPS + 1)]
+    config_vteps(tgen, vteps)
 
-    hosts = ["hostd11", "hostd12", "hostd21", "hostd22"]
+    # Configure all hosts
+    hosts = [f"host{i}" for i in range(1, NUM_HOSTS + 1)]
     config_hosts(tgen, hosts)
 
     router_list = tgen.routers()
     for rname, router in router_list.items():
-        router.load_config(TopoRouter.RD_ZEBRA, os.path.join(CWD, "{}/zebra.conf".format(rname)))
-        router.load_config(TopoRouter.RD_BGP, os.path.join(CWD, "{}/evpn.conf".format(rname)))
+        router.load_config(
+            TopoRouter.RD_ZEBRA, os.path.join(CWD, "{}/zebra.conf".format(rname))
+        )
+        router.load_config(
+            TopoRouter.RD_BGP, os.path.join(CWD, "{}/evpn.conf".format(rname))
+        )
     tgen.start_router()
 
-def teardown_module(_mod):
-    tgen = get_topogen()
+    # Provide tgen as argument to each test function
+    yield tgen
     tgen.stop_topology()
 
 
@@ -354,31 +522,31 @@ def skip_on_failure(tgen):
 
 
 #####################################################
-##   Mobility Simulation Test
+##   Test Functions
 #####################################################
 
 def create_macvlan_endpoint(tgen, host_name, vm_name, ip, mac):
     """Create a MACVLAN interface on a host to simulate a VM/container."""
     host = tgen.gears[host_name]
-    logger = host.logger
-    logger.info(f"Creating MACVLAN {vm_name} on {host_name} with IP {ip} MAC {mac}")
-    
-    # 1. Add link of type macvlan linked to the physical bond (torbond)
-    host.run(f"ip link add link torbond name {vm_name} type macvlan mode bridge")
-    
+    print(f"Creating MACVLAN {vm_name} on {host_name} with IP {ip} MAC {mac}")
+
+    # 1. Add link of type macvlan linked to the physical bond (vtepbond)
+    host.run(f"ip link add link vtepbond name {vm_name} type macvlan mode bridge")
+
     # 2. Set MAC address
     host.run(f"ip link set dev {vm_name} address {mac}")
-    
+
     # 3. Set IP address
     host.run(f"ip addr add {ip} dev {vm_name}")
-    
+
     # 4. Bring up
     host.run(f"ip link set dev {vm_name} up")
+
 
 def delete_macvlan_endpoint(tgen, host_name, vm_name):
     """Delete a MACVLAN interface to simulate VM departure."""
     host = tgen.gears[host_name]
-    host.logger.info(f"Deleting MACVLAN {vm_name} from {host_name}")
+    print(f"Deleting MACVLAN {vm_name} from {host_name}")
     host.run(f"ip link del {vm_name}")
 
 
@@ -502,6 +670,9 @@ def test_mobility(tgen):
     #####################################################
     print("\nStarting Packet Capturing on spine1 and controller VTEP...")
     print(f"Using mobility overlap timer: {MOBILITY_OVERLAP_SECONDS:.3f}s")
+    print(f"Migration batch size: {MIGRATION_BATCH_SIZE}")
+    print(f"Batch settle timer: {MIGRATION_BATCH_SETTLE_SECONDS:.3f}s")
+    print(f"Batch safety rollback: {ENABLE_MIGRATION_BATCH_SAFETY_ROLLBACK}")
     print(f"Packet count threshold: {format_binary_size(PCAP_PACKET_COUNT_MAX_BYTES)}")
     
     spine = tgen.gears["spine1"]                                # Run packet capture on spine1.
@@ -602,47 +773,34 @@ def test_mobility(tgen):
         print(f"\nPhase 3: Moving {NUM_MOBILE_VMS} VMs to different locations...")
         print("(Creating at destination while source exists, then cleaning up source)")
         
-        for vm_idx in range(1, NUM_MOBILE_VMS + 1):
-            vm_name = f"vm{vm_idx}"
-            
-            # Get current location.
-            old_host_idx, old_vtep_idx = vm_locations[vm_name]
-            old_host_name = f"host{old_host_idx}"
-            
-            # Compute new location on the next mobility-eligible VTEP.
-            current_pos = mobility_vtep_indices.index(old_vtep_idx)
-            new_vtep_idx = mobility_vtep_indices[(current_pos + 1) % len(mobility_vtep_indices)]
-            
-            # Find a mobility-eligible host on the new VTEP.
-            # Hosts are distributed round-robin, so host_i is on vtep(((i-1) % NUM_VTEPS) + 1).
-            new_host_idx = None
-            for potential_host in mobility_host_indices:
-                if host_to_vtep_index(potential_host) == new_vtep_idx and potential_host != old_host_idx:
-                    new_host_idx = potential_host
-                    break
-            
-            if new_host_idx is None:
-                # Fallback: pick any mobility-eligible host on the new VTEP.
-                for potential_host in mobility_host_indices:
-                    if host_to_vtep_index(potential_host) == new_vtep_idx:
-                        new_host_idx = potential_host
-                        break
+        for batch_start in range(1, NUM_MOBILE_VMS + 1, MIGRATION_BATCH_SIZE):
+            batch_end = min(batch_start + MIGRATION_BATCH_SIZE - 1, NUM_MOBILE_VMS)
+            migration_batch = []
 
-            assert new_host_idx is not None, f"No destination host found for VTEP index {new_vtep_idx}"
+            for vm_idx in range(batch_start, batch_end + 1):
+                migration_batch.append(
+                    build_vm_migration_plan(
+                        vm_idx,
+                        vm_locations,
+                        mobility_vtep_indices,
+                        mobility_host_indices,
+                    )
+                )
 
-            new_host_name = f"host{new_host_idx}"
+            migrate_macvlan_endpoints_live_batch(tgen, migration_batch)
 
-            # Compute VM IP and MAC.
-            vm_ip = f"192.168.100.{vm_idx}/16"
-            vm_mac = "00:aa:bb:cc:{:02x}:{:02x}".format((vm_idx >> 8) & 0xFF, vm_idx & 0xFF)
+            for migration in migration_batch:
+                vm_locations[migration["vm_name"]] = (
+                    migration["new_host_idx"],
+                    migration["new_vtep_idx"],
+                )
 
-            # Perform live migration (create at destination, then delete from source).
-            migrate_macvlan_endpoint_live(tgen, old_host_name, new_host_name, vm_name, vm_ip, vm_mac)
-            vm_locations[vm_name] = (new_host_idx, new_vtep_idx)
+            moved_count = batch_end
+            if moved_count % 20 == 0 or moved_count == NUM_MOBILE_VMS:
+                print(f"  Migration progress: {moved_count}/{NUM_MOBILE_VMS}")
 
-            # Rate-limit migrations to observe network behavior.
-            if vm_idx % 5 == 0:
-                sleep(1)
+            if MIGRATION_BATCH_SETTLE_SECONDS > 0.0:
+                sleep(MIGRATION_BATCH_SETTLE_SECONDS)
 
         # Wait for all BGP/EVPN updates to process.
         sleep(5)

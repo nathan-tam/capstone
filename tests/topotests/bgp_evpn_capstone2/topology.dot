@@ -1,0 +1,52 @@
+graph spine_leaf {
+    layout=dot;
+    overlap=false;
+    splines=true;
+    labelloc="top";
+    label="L2VPN BGP EVPN Topology";   
+    node [style=filled, fontsize=10];
+
+    // Spine nodes
+    SPINE1 [shape=box, fillcolor=lightblue, label="SPINE1"];
+    SPINE2 [shape=box, fillcolor=lightblue, label="SPINE2"];
+
+    // // === VNI Cluster (VTEPs) ===
+    // subgraph cluster_VNI100 {
+    //     label="VNI 100";
+    //     color=green;
+    //     style=dashed;
+    //     // penwidth=2;
+
+    //     // VTEPs inside this VNI
+        VTEP1 [shape=octagon, fillcolor=orange, label="VTEP1"];
+        VTEP2 [shape=octagon, fillcolor=orange, label="VTEP2"];
+        VTEP3 [shape=octagon, fillcolor=orange, label="VTEP3"];
+
+        // Rank alignment within cluster
+        // { rank=same; VTEP1; VTEP2; VTEP3; }
+    // }
+
+    // Hosts
+    H1 [shape=ellipse, fillcolor=yellow];
+    H2 [shape=ellipse, fillcolor=yellow];
+    H3 [shape=ellipse, fillcolor=yellow];
+
+    // === Connections (with interface labels) ===
+    // r1 links
+    SPINE1 -- VTEP1
+    SPINE1 -- VTEP2
+    SPINE1 -- VTEP3
+
+    // r2 links
+    SPINE2 -- VTEP1;
+    SPINE2 -- VTEP2 
+    SPINE2 -- VTEP3 
+
+    // host links
+    VTEP1 -- H1
+    VTEP2 -- H2
+    VTEP3 -- H3 
+
+    // Rank hints for clean layout
+    { rank=same; SPINE1; SPINE2; }
+}
