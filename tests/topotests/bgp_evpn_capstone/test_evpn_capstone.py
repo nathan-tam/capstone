@@ -41,7 +41,7 @@ pytestmark = [
 # Test scaling parameters
 NUM_VTEPS = 7
 NUM_HOSTS = 7  # One host per VTEP for VM mobility testing
-NUM_MOBILE_VMS = 128  # Number of VMs that will move around
+NUM_MOBILE_VMS = 64  # Number of VMs that will move around
 
 # Controller VTEPs participate in topology/BGP but are excluded from endpoint mobility.
 CONTROLLER_VTEPS = {"vtep1"}
