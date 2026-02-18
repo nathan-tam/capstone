@@ -54,6 +54,16 @@ NUM_MOBILE_VMS = 128  # Number of VMs that will move around
 # Controller VTEPs participate in topology/BGP but are excluded from endpoint mobility.
 CONTROLLER_VTEPS = {"vtep1"}
 
+# Static endpoint attached to the controller side (host on controller VTEP).
+CONTROLLER_ENDPOINT_HOST = "host1"
+CONTROLLER_ENDPOINT_IFACE = "controller"
+CONTROLLER_ENDPOINT_IP = "192.168.100.254/16"
+CONTROLLER_ENDPOINT_MAC = "00:aa:bb:dd:00:01"
+
+# Toggle controller-to-VM ping verification during phase 2 and phase 4.
+# Set to False to skip controller reachability sweeps while keeping mobility logic unchanged.
+ENABLE_CONTROLLER_PING_CHECKS = False
+
 vtep_ips = {
     f"vtep{i}": f"{10*i}.{10*i}.{10*i}.{10*i}" 
     for i in range(1, NUM_VTEPS + 1)
@@ -368,6 +378,68 @@ def migrate_macvlan_endpoint_live(tgen, old_host_name, new_host_name, vm_name, i
     delete_macvlan_endpoint(tgen, old_host_name, vm_name)
 
 
+def create_controller_endpoint(tgen):
+    """Create the static controller endpoint on the controller-side host."""
+    # Make creation idempotent in case a previous run exited before cleanup.
+    delete_macvlan_endpoint_if_exists(
+        tgen,
+        CONTROLLER_ENDPOINT_HOST,
+        CONTROLLER_ENDPOINT_IFACE,
+    )
+
+    create_macvlan_endpoint(
+        tgen,
+        CONTROLLER_ENDPOINT_HOST,
+        CONTROLLER_ENDPOINT_IFACE,
+        CONTROLLER_ENDPOINT_IP,
+        CONTROLLER_ENDPOINT_MAC,
+    )
+
+
+def delete_macvlan_endpoint_if_exists(tgen, host_name, vm_name):
+    """Delete a MACVLAN endpoint if present, ignoring missing-interface cases."""
+    host = tgen.gears[host_name]
+    host.run(f"ip link show {vm_name} >/dev/null 2>&1 && ip link del {vm_name} || true")
+
+
+def verify_controller_to_vm_connectivity(tgen, num_mobile_vms, phase_name):
+    """Verify static controller endpoint can ping all mobile VM IPs."""
+    connectivity_failures = 0
+    progress_interval = 10
+
+    print(f"\nController reachability check ({phase_name})...")
+    print(
+        f"Checking {num_mobile_vms} VM endpoints from {CONTROLLER_ENDPOINT_HOST}:{CONTROLLER_ENDPOINT_IFACE}"
+    )
+
+    for vm_idx in range(1, num_mobile_vms + 1):
+        target_ip = f"192.168.100.{vm_idx}"
+        if verify_ping(
+            tgen,
+            CONTROLLER_ENDPOINT_HOST,
+            CONTROLLER_ENDPOINT_IFACE,
+            target_ip,
+            count=1,
+        ):
+            if vm_idx % 20 == 0:
+                print(f"  ✓ controller -> vm{vm_idx} ({target_ip})")
+        else:
+            print(f"  ✗ controller -> vm{vm_idx} ({target_ip}) FAILED")
+            connectivity_failures += 1
+
+        if vm_idx % progress_interval == 0 or vm_idx == num_mobile_vms:
+            checked = vm_idx
+            print(
+                f"  Progress: {checked}/{num_mobile_vms} checked, failures so far: {connectivity_failures}"
+            )
+
+    assert (
+        connectivity_failures == 0
+    ), f"controller endpoint failed to reach {connectivity_failures}/{num_mobile_vms} VMs during {phase_name}"
+
+    print(f"Controller reachability check ({phase_name}) PASSED: all {num_mobile_vms} VMs reachable")
+
+
 
 def test_mobility(tgen):
     """
@@ -380,14 +452,20 @@ def test_mobility(tgen):
 
     Steps:
     1. Deploy 128 VMs distributed across hosts (one per VTEP)
-    2. Verify connectivity from initial locations
+    2. Verify controller endpoint can reach all VM IPs at initial locations
     3. Live-migrate each VM to a different VTEP (brief duplicate-MAC window)
-    4. Verify connectivity at new locations
+    4. Verify controller endpoint can still reach all VM IPs after migration
     5. Capture BGP packet data during migrations
     """
 
     # Anycast gateway.
     gateway_ip = "192.168.0.250"
+
+    controller_host_idx = int(CONTROLLER_ENDPOINT_HOST.replace("host", ""))
+    controller_vtep_name = vtep_name_from_index(host_to_vtep_index(controller_host_idx))
+    assert (
+        controller_vtep_name in CONTROLLER_VTEPS
+    ), f"{CONTROLLER_ENDPOINT_HOST} is mapped to {controller_vtep_name}, but is not in CONTROLLER_VTEPS"
 
     mobility_vtep_indices = get_mobility_vtep_indices()
     mobility_host_indices = get_mobility_host_indices()
@@ -418,112 +496,131 @@ def test_mobility(tgen):
 
     sleep(1)    # Give tcpdump a brief startup window before mobility begins.
 
-    #####################################################
-    # SECTION: Mobility Simulation
-    #####################################################
-    print("\n=== Starting Mobility Simulation Test with {} VMs ===\n".format(NUM_MOBILE_VMS))
+    try:
+        # Create static controller endpoint before mobility begins.
+        create_controller_endpoint(tgen)
 
-    # Track VM locations as: {vm_name: (current_host, current_vtep_idx)}.
-    vm_locations = {}
+        #####################################################
+        # SECTION: Mobility Simulation
+        #####################################################
+        print("\n=== Starting Mobility Simulation Test with {} VMs ===\n".format(NUM_MOBILE_VMS))
 
-    # --- Phase 1: deploy VMs on initial hosts --- #
-    print(f"Phase 1: Deploying {NUM_MOBILE_VMS} VMs on hosts...")
-    
-    # Configure addressing.
-    for vm_idx in range(1, NUM_MOBILE_VMS + 1):
-        # VM naming scheme: vm1, vm2, ..., vm128.
-        vm_name = f"vm{vm_idx}"
-        
-        # Use 192.168.100.x for mobile VMs (up to 254 VMs).
-        vm_ip = f"192.168.100.{vm_idx}/16"
-        
-        # Generate a deterministic MAC from the VM index using bit shifts.
-        vm_mac = "00:aa:bb:cc:{:02x}:{:02x}".format((vm_idx >> 8) & 0xFF, vm_idx & 0xFF)
+        # Track VM locations as: {vm_name: (current_host, current_vtep_idx)}.
+        vm_locations = {}
 
-        # Distribute VMs round-robin across mobility-eligible hosts only.
-        host_idx = mobility_host_indices[(vm_idx - 1) % len(mobility_host_indices)]
-        host_name = f"host{host_idx}"
+        # --- Phase 1: deploy VMs on initial hosts --- #
+        print(f"Phase 1: Deploying {NUM_MOBILE_VMS} VMs on hosts...")
         
-        # Determine which VTEP this host is connected to.
-        vtep_idx = host_to_vtep_index(host_idx)
+        # Configure addressing.
+        for vm_idx in range(1, NUM_MOBILE_VMS + 1):
+            # VM naming scheme: vm1, vm2, ..., vm128.
+            vm_name = f"vm{vm_idx}"
+            
+            # Use 192.168.100.x for mobile VMs (up to 254 VMs).
+            vm_ip = f"192.168.100.{vm_idx}/16"
+            
+            # Generate a deterministic MAC from the VM index using bit shifts.
+            vm_mac = "00:aa:bb:cc:{:02x}:{:02x}".format((vm_idx >> 8) & 0xFF, vm_idx & 0xFF)
 
-        # create the MACVLAN endpoint to simulate the VM
-        create_macvlan_endpoint(tgen, host_name, vm_name, vm_ip, vm_mac)
-        
-        # Add the VM to the tracking dictionary.
-        vm_locations[vm_name] = (host_idx, vtep_idx)
+            # Distribute VMs round-robin across mobility-eligible hosts only.
+            host_idx = mobility_host_indices[(vm_idx - 1) % len(mobility_host_indices)]
+            host_name = f"host{host_idx}"
+            
+            # Determine which VTEP this host is connected to.
+            vtep_idx = host_to_vtep_index(host_idx)
 
-        # Every 5 VMs, pause briefly to allow BGP/EVPN updates.
-        if vm_idx % 5 == 0:
-            # Give BGP/EVPN a moment to advertise between VM additions.
-            sleep(1)
+            # Create the MACVLAN endpoint to simulate the VM.
+            create_macvlan_endpoint(tgen, host_name, vm_name, vm_ip, vm_mac)
+            
+            # Add the VM to the tracking dictionary.
+            vm_locations[vm_name] = (host_idx, vtep_idx)
 
-    # Wait for BGP/EVPN to stabilize.
-    sleep(3)
+            # Every 5 VMs, pause briefly to allow BGP/EVPN updates.
+            if vm_idx % 5 == 0:
+                # Give BGP/EVPN a moment to advertise between VM additions.
+                sleep(1)
 
-    # --- Phase 2: verify initial connectivity --- #
-    print("\nPhase 2: Verifying connectivity from initial locations...")
-    print("This will take a while...make a coffee, get a snack!\n")
-    # Intentionally disabled for now:
-    # verify_initial_connectivity(tgen, vm_locations, gateway_ip, NUM_MOBILE_VMS)
+        # Wait for BGP/EVPN to stabilize.
+        sleep(3)
 
-    # --- Phase 3: migrate VMs to different VTEPs --- #
-    print(f"\nPhase 3: Moving {NUM_MOBILE_VMS} VMs to different locations...")
-    print("(Creating at destination while source exists, then cleaning up source)")
-    
-    for vm_idx in range(1, NUM_MOBILE_VMS + 1):
-        vm_name = f"vm{vm_idx}"
+        # --- Phase 2: verify initial connectivity --- #
+        print("\nPhase 2: Verifying connectivity from initial locations...")
+        print("This will take a while...make a coffee, get a snack!\n")
+        if ENABLE_CONTROLLER_PING_CHECKS:
+            verify_controller_to_vm_connectivity(tgen, NUM_MOBILE_VMS, "initial deployment")
+        else:
+            print("Controller ping checks are disabled (initial deployment phase).")
+        # Intentionally disabled for now:
+        # verify_initial_connectivity(tgen, vm_locations, gateway_ip, NUM_MOBILE_VMS)
+
+        # --- Phase 3: migrate VMs to different VTEPs --- #
+        print(f"\nPhase 3: Moving {NUM_MOBILE_VMS} VMs to different locations...")
+        print("(Creating at destination while source exists, then cleaning up source)")
         
-        # Get current location.
-        old_host_idx, old_vtep_idx = vm_locations[vm_name]
-        old_host_name = f"host{old_host_idx}"
-        
-        # Compute new location on the next mobility-eligible VTEP.
-        current_pos = mobility_vtep_indices.index(old_vtep_idx)
-        new_vtep_idx = mobility_vtep_indices[(current_pos + 1) % len(mobility_vtep_indices)]
-        
-        # Find a mobility-eligible host on the new VTEP.
-        # Hosts are distributed round-robin, so host_i is on vtep(((i-1) % NUM_VTEPS) + 1).
-        new_host_idx = None
-        for potential_host in mobility_host_indices:
-            if host_to_vtep_index(potential_host) == new_vtep_idx and potential_host != old_host_idx:
-                new_host_idx = potential_host
-                break
-        
-        if new_host_idx is None:
-            # Fallback: pick any mobility-eligible host on the new VTEP.
+        for vm_idx in range(1, NUM_MOBILE_VMS + 1):
+            vm_name = f"vm{vm_idx}"
+            
+            # Get current location.
+            old_host_idx, old_vtep_idx = vm_locations[vm_name]
+            old_host_name = f"host{old_host_idx}"
+            
+            # Compute new location on the next mobility-eligible VTEP.
+            current_pos = mobility_vtep_indices.index(old_vtep_idx)
+            new_vtep_idx = mobility_vtep_indices[(current_pos + 1) % len(mobility_vtep_indices)]
+            
+            # Find a mobility-eligible host on the new VTEP.
+            # Hosts are distributed round-robin, so host_i is on vtep(((i-1) % NUM_VTEPS) + 1).
+            new_host_idx = None
             for potential_host in mobility_host_indices:
-                if host_to_vtep_index(potential_host) == new_vtep_idx:
+                if host_to_vtep_index(potential_host) == new_vtep_idx and potential_host != old_host_idx:
                     new_host_idx = potential_host
                     break
+            
+            if new_host_idx is None:
+                # Fallback: pick any mobility-eligible host on the new VTEP.
+                for potential_host in mobility_host_indices:
+                    if host_to_vtep_index(potential_host) == new_vtep_idx:
+                        new_host_idx = potential_host
+                        break
 
-        assert new_host_idx is not None, f"No destination host found for VTEP index {new_vtep_idx}"
+            assert new_host_idx is not None, f"No destination host found for VTEP index {new_vtep_idx}"
 
-        new_host_name = f"host{new_host_idx}"
+            new_host_name = f"host{new_host_idx}"
 
-        # Compute VM IP and MAC
-        vm_ip = f"192.168.100.{vm_idx}/16"
-        vm_mac = "00:aa:bb:cc:{:02x}:{:02x}".format((vm_idx >> 8) & 0xFF, vm_idx & 0xFF)
+            # Compute VM IP and MAC.
+            vm_ip = f"192.168.100.{vm_idx}/16"
+            vm_mac = "00:aa:bb:cc:{:02x}:{:02x}".format((vm_idx >> 8) & 0xFF, vm_idx & 0xFF)
 
-        # Perform live migration (create at destination, then delete from source).
-        migrate_macvlan_endpoint_live(tgen, old_host_name, new_host_name, vm_name, vm_ip, vm_mac)
-        vm_locations[vm_name] = (new_host_idx, new_vtep_idx)
+            # Perform live migration (create at destination, then delete from source).
+            migrate_macvlan_endpoint_live(tgen, old_host_name, new_host_name, vm_name, vm_ip, vm_mac)
+            vm_locations[vm_name] = (new_host_idx, new_vtep_idx)
 
-        # Rate-limit migrations to observe network behavior.
-        if vm_idx % 5 == 0:
-            sleep(1)
+            # Rate-limit migrations to observe network behavior.
+            if vm_idx % 5 == 0:
+                sleep(1)
 
-    # Wait for all BGP/EVPN updates to process.
-    sleep(5)
+        # Wait for all BGP/EVPN updates to process.
+        sleep(5)
 
-    # --- Phase 4: verify connectivity at new locations --- #
-    print("\nPhase 4: Verifying connectivity at new locations...")
-    # Intentionally disabled for now:
-    # verify_post_migration_connectivity(tgen, vm_locations, gateway_ip, NUM_MOBILE_VMS)
+        # --- Phase 4: verify connectivity at new locations --- #
+        print("\nPhase 4: Verifying connectivity at new locations...")
+        if ENABLE_CONTROLLER_PING_CHECKS:
+            verify_controller_to_vm_connectivity(tgen, NUM_MOBILE_VMS, "post migration")
+        else:
+            print("Controller ping checks are disabled (post migration phase).")
+        # Intentionally disabled for now:
+        # verify_post_migration_connectivity(tgen, vm_locations, gateway_ip, NUM_MOBILE_VMS)
+    finally:
+        # Stop capture and flush output.
+        spine.run("if [ -f /tmp/tcpdump_evpn.pid ]; then kill $(cat /tmp/tcpdump_evpn.pid); fi")
+        spine.run("sleep 1")
 
-    # Stop capture and flush output.
-    spine.run("if [ -f /tmp/tcpdump_evpn.pid ]; then kill $(cat /tmp/tcpdump_evpn.pid); fi")
-    spine.run("sleep 1")
+        # Remove controller endpoint to keep test namespace clean.
+        delete_macvlan_endpoint_if_exists(
+            tgen,
+            CONTROLLER_ENDPOINT_HOST,
+            CONTROLLER_ENDPOINT_IFACE,
+        )
 
     # Run with MUNET_CLI=1 to drop into CLI after test completion.
     if os.getenv("MUNET_CLI") == "1":

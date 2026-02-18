@@ -18,6 +18,7 @@ This document describes the current implementation of the EVPN mobility topotest
 - Controller VTEPs are intentionally excluded from VM endpoint placement and migration
 - Mobility operations run only on mobility-eligible VTEPs/hosts
 - With current settings, this means 6 mobility-eligible VTEPs and 6 mobility-eligible hosts
+- A static controller endpoint (`controller`) is created on `host1` to probe mobility endpoints
 
 #### Configuration Knob
 
@@ -83,6 +84,10 @@ Each VTEP connects to:
 
 - Each host uses bond `vtepbond`
 - Mobile endpoints are MACVLAN interfaces (`mode bridge`) created on `vtepbond`
+- A static controller endpoint is also modeled as a MACVLAN on `host1`:
+  - Interface: `controller`
+  - IP: `192.168.100.254/16`
+  - MAC: `00:aa:bb:dd:00:01`
 - VM naming: `vm1`..`vm128`
 - VM MAC formula:
 
@@ -104,6 +109,7 @@ The test executes four phases in order:
 ### Phase 2: Initial Connectivity Verification
 
 - Test code prints the phase banner
+- The static `controller` endpoint pings all VM IPs and asserts zero failures
 - The connectivity helper exists, but the call is currently commented out
 
 ### Phase 3: Live Migration
@@ -122,6 +128,7 @@ Note: the test includes guard assertions requiring at least two mobility-eligibl
 ### Phase 4: Post-Migration Verification
 
 - Test code prints the phase banner
+- The static `controller` endpoint again pings all VM IPs and asserts zero failures
 - The post-migration connectivity helper exists, but the call is currently commented out
 
 ## Packet Capture
@@ -149,6 +156,7 @@ Current topology includes:
 
 - Topology and daemons start successfully
 - Mobility loop executes for all 128 VMs without fatal test exceptions
+- Static `controller` endpoint reaches all VM IPs before and after migration
 - Packet capture file is expected to be produced when `tcpdump` starts successfully
 
 If connectivity checks are uncommented, additional criteria become:
