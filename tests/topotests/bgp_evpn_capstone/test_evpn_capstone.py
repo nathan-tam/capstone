@@ -47,14 +47,45 @@ pytestmark = [
 #####################################################
 
 # Test scaling parameters
-NUM_VTEPS = 6
-NUM_HOSTS = 6  # One host per VTEP for VM mobility testing
+NUM_VTEPS = 7
+NUM_HOSTS = 7  # One host per VTEP for VM mobility testing
 NUM_MOBILE_VMS = 128  # Number of VMs that will move around
+
+# Controller VTEPs participate in topology/BGP but are excluded from endpoint mobility.
+CONTROLLER_VTEPS = {"vtep1"}
 
 vtep_ips = {
     f"vtep{i}": f"{10*i}.{10*i}.{10*i}.{10*i}" 
     for i in range(1, NUM_VTEPS + 1)
 }
+
+
+def vtep_name_from_index(vtep_index):
+    return f"vtep{vtep_index}"
+
+
+def host_to_vtep_index(host_index):
+    # Hosts are attached round-robin to VTEPs in build_topo().
+    return ((host_index - 1) % NUM_VTEPS) + 1
+
+
+def get_mobility_vtep_indices():
+    # Mobility-eligible VTEPs are all VTEPs that are not marked as controllers.
+    return [
+        i
+        for i in range(1, NUM_VTEPS + 1)
+        if vtep_name_from_index(i) not in CONTROLLER_VTEPS
+    ]
+
+
+def get_mobility_host_indices():
+    # Mobility-eligible hosts are hosts connected to mobility-eligible VTEPs.
+    mobility_vtep_indices = set(get_mobility_vtep_indices())
+    return [
+        host_idx
+        for host_idx in range(1, NUM_HOSTS + 1)
+        if host_to_vtep_index(host_idx) in mobility_vtep_indices
+    ]
 
 def compute_svi_ip(vtep_index):
     # Keep legacy SVI assignment for vtep1-vtep5.
@@ -340,7 +371,10 @@ def migrate_macvlan_endpoint_live(tgen, old_host_name, new_host_name, vm_name, i
 
 def test_mobility(tgen):
     """
-    Simulates 128 VMs moving between VTEPs (via one host per VTEP) to establish a baseline for 
+    Simulates 128 VMs moving between mobility-eligible VTEPs (via one host per VTEP)
+    while keeping controller VTEPs static in the control plane.
+
+    This establishes a baseline for
     network traffic measurements. This creates high control plane stress by simulating
     live VM migrations.
 
@@ -354,6 +388,14 @@ def test_mobility(tgen):
 
     # Anycast gateway.
     gateway_ip = "192.168.0.250"
+
+    mobility_vtep_indices = get_mobility_vtep_indices()
+    mobility_host_indices = get_mobility_host_indices()
+
+    # Guardrails for controller-VTEP mode.
+    assert mobility_vtep_indices, "No mobility-eligible VTEPs are configured"
+    assert len(mobility_vtep_indices) >= 2, "Need at least two mobility-eligible VTEPs"
+    assert mobility_host_indices, "No mobility-eligible hosts are available"
 
     #####################################################
     # SECTION: Packet Capture Setup
@@ -398,12 +440,12 @@ def test_mobility(tgen):
         # Generate a deterministic MAC from the VM index using bit shifts.
         vm_mac = "00:aa:bb:cc:{:02x}:{:02x}".format((vm_idx >> 8) & 0xFF, vm_idx & 0xFF)
 
-        # distribute VMs round-robin across hosts
-        host_idx = ((vm_idx - 1) % NUM_HOSTS) + 1
+        # Distribute VMs round-robin across mobility-eligible hosts only.
+        host_idx = mobility_host_indices[(vm_idx - 1) % len(mobility_host_indices)]
         host_name = f"host{host_idx}"
         
         # Determine which VTEP this host is connected to.
-        vtep_idx = (host_idx - 1) % NUM_VTEPS
+        vtep_idx = host_to_vtep_index(host_idx)
 
         # create the MACVLAN endpoint to simulate the VM
         create_macvlan_endpoint(tgen, host_name, vm_name, vm_ip, vm_mac)
@@ -436,23 +478,26 @@ def test_mobility(tgen):
         old_host_idx, old_vtep_idx = vm_locations[vm_name]
         old_host_name = f"host{old_host_idx}"
         
-        # Compute new location on a different VTEP.
-        new_vtep_idx = (old_vtep_idx + 1) % NUM_VTEPS
+        # Compute new location on the next mobility-eligible VTEP.
+        current_pos = mobility_vtep_indices.index(old_vtep_idx)
+        new_vtep_idx = mobility_vtep_indices[(current_pos + 1) % len(mobility_vtep_indices)]
         
-        # Find a host on the new VTEP
-        # Hosts are distributed round-robin, so host_i is on vtep((i-1) % NUM_VTEPS)
+        # Find a mobility-eligible host on the new VTEP.
+        # Hosts are distributed round-robin, so host_i is on vtep(((i-1) % NUM_VTEPS) + 1).
         new_host_idx = None
-        for potential_host in range(1, NUM_HOSTS + 1):
-            if ((potential_host - 1) % NUM_VTEPS) == new_vtep_idx and potential_host != old_host_idx:
+        for potential_host in mobility_host_indices:
+            if host_to_vtep_index(potential_host) == new_vtep_idx and potential_host != old_host_idx:
                 new_host_idx = potential_host
                 break
         
         if new_host_idx is None:
-            # Fallback: pick any host on the new VTEP.
-            for potential_host in range(1, NUM_HOSTS + 1):
-                if ((potential_host - 1) % NUM_VTEPS) == new_vtep_idx:
+            # Fallback: pick any mobility-eligible host on the new VTEP.
+            for potential_host in mobility_host_indices:
+                if host_to_vtep_index(potential_host) == new_vtep_idx:
                     new_host_idx = potential_host
                     break
+
+        assert new_host_idx is not None, f"No destination host found for VTEP index {new_vtep_idx}"
 
         new_host_name = f"host{new_host_idx}"
 

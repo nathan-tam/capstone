@@ -6,10 +6,35 @@ This document describes the current implementation of the EVPN mobility topotest
 
 ## Current Scope
 
-- 6 VTEPs (EVPN leaf nodes)
+- 7 VTEPs (EVPN leaf nodes)
 - 2 spine routers
-- 6 hosts (one host connected to each VTEP)
+- 7 hosts (one host connected to each VTEP)
 - 128 mobile VM endpoints (simulated MACVLAN interfaces)
+
+### Controller VTEP Role
+
+- `vtep1` is configured as a controller/static VTEP in test logic (`CONTROLLER_VTEPS = {"vtep1"}`)
+- Controller VTEPs still participate fully in topology and BGP/EVPN control plane
+- Controller VTEPs are intentionally excluded from VM endpoint placement and migration
+- Mobility operations run only on mobility-eligible VTEPs/hosts
+- With current settings, this means 6 mobility-eligible VTEPs and 6 mobility-eligible hosts
+
+#### Configuration Knob
+
+You can change controller participation by editing `CONTROLLER_VTEPS` in `test_evpn_capstone.py`.
+
+Examples:
+
+- Single controller VTEP: `CONTROLLER_VTEPS = {"vtep1"}`
+- Two controller VTEPs: `CONTROLLER_VTEPS = {"vtep1", "vtep2"}`
+- No controller VTEP mode: `CONTROLLER_VTEPS = set()`
+
+Constraints enforced by test guard assertions:
+
+- At least one mobility-eligible host must exist
+- At least two mobility-eligible VTEPs must exist
+
+If these constraints are violated, the test fails early with an explicit assertion message.
 
 ## Network Topology
 
@@ -23,22 +48,22 @@ Each VTEP connects to:
 
 ```text
                      spine1 ---------------- spine2
-                    /   |   \   \   \         /   |   \   \   \
-                   /    |    \   \   \       /    |    \   \   \
-               vtep1 vtep2 vtep3 vtep4 vtep5 vtep6
-                 |     |     |     |     |     |
-               host1 host2 host3 host4 host5 host6
+                    /  |  |  |  |  |  \     /  |  |  |  |  |  \
+                   /   |  |  |  |  |   \   /   |  |  |  |  |   \
+               vtep1 vtep2 vtep3 vtep4 vtep5 vtep6 vtep7
+                 |     |     |     |     |     |     |
+               host1 host2 host3 host4 host5 host6 host7
 ```
 
 ### Addressing Scheme
 
-- VTEP BGP router-id values (from per-VTEP BGP config): `192.168.100.15` to `192.168.100.20` (`vtep1`..`vtep6`)
+- VTEP BGP router-id values (from per-VTEP BGP config): `192.168.100.15` to `192.168.100.21` (`vtep1`..`vtep7`)
 - VTEP VXLAN local source IPs (set by test setup code): `{10*i}.{10*i}.{10*i}.{10*i}` for VTEP `i`
 - SVI IPs:
   - `vtep1`..`vtep5`: `192.168.0.251` through `192.168.0.255`
   - `vtep6+`: `192.168.200.x` (introduced to avoid invalid `.256` and avoid overlap with underlay subnets)
 - Anycast gateway on all VTEPs: `192.168.0.250/16`
-- Host IPs (`host1`..`host6` in current scale): `192.168.0.1/16` through `192.168.0.6/16`
+- Host IPs (`host1`..`host7` in current scale): `192.168.0.1/16` through `192.168.0.7/16`
 - Mobile VM IPs: `192.168.100.1/16` through `192.168.100.128/16`
 
 ---
@@ -72,7 +97,7 @@ The test executes four phases in order:
 ### Phase 1: VM Deployment
 
 - Deploy 128 VM MACVLAN interfaces
-- Distribute round-robin across the 6 hosts
+- Distribute round-robin across mobility-eligible hosts only (currently 6 hosts)
 - Pause every 5 VMs for control-plane settling
 - Final stabilization sleep
 
@@ -86,11 +111,13 @@ The test executes four phases in order:
 For each VM:
 
 1. Determine current host/VTEP
-2. Select host on next VTEP (`(old_vtep + 1) % NUM_VTEPS`)
+2. Select host on next mobility-eligible VTEP in the mobility VTEP ring
 3. Live move sequence:
    - Create VM MACVLAN on destination host
    - Sleep 500ms (intentional duplicate MAC window)
    - Delete VM MACVLAN from source host
+
+Note: the test includes guard assertions requiring at least two mobility-eligible VTEPs and at least one mobility-eligible host.
 
 ### Phase 4: Post-Migration Verification
 
@@ -115,8 +142,8 @@ Per-node files expected by test loader:
 Current topology includes:
 
 - `spine1`, `spine2`
-- `vtep1`..`vtep6`
-- `host1`..`host6`
+- `vtep1`..`vtep7`
+- `host1`..`host7`
 
 ## Success Criteria (Current Behavior)
 
@@ -133,7 +160,7 @@ If connectivity checks are uncommented, additional criteria become:
 
 - Control-plane stress from 128 sequential mobility events
 - BGP update behavior during duplicate-MAC and move windows
-- Scale validation at current lab topology size (6 VTEPs, 6 hosts)
+- Scale validation at current lab topology size (7 VTEPs, 7 hosts, with controller/static VTEP support)
 
 ## Debugging
 
