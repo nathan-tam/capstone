@@ -1,28 +1,30 @@
 # EVPN Capstone Test Suite
 
-This document describes the current implementation of the EVPN mobility topotest in this directory.
+This document reflects the current behavior of `test_evpn_capstone.py` in this directory.
 
-The test validates BGP EVPN (L2VNI) behavior during repeated MAC mobility events. It creates a small Clos fabric, deploys MACVLAN endpoints, migrates them between VTEPs, and captures control/data-plane traffic for offline analysis.
+The test validates EVPN MAC mobility behavior by creating endpoints, migrating them between VTEPs, and collecting BGP packet captures.
 
 ## Current Scope
 
-- 7 VTEPs (EVPN leaf nodes)
-- 2 spine routers
-- 7 hosts (one host connected to each VTEP)
-- 128 mobile VM endpoints (MACVLAN interfaces)
+- 7 VTEPs
+- 2 spines
+- 7 hosts (one per VTEP)
+- 64 mobile VM endpoints (`vm1..vm64`)
 
-Controller role:
+Controller model:
 
-- vtep1 is configured as controller/static in test logic
-- Controller VTEPs still participate in topology and EVPN control-plane
-- Controller VTEPs are excluded from VM placement and migration
-- With current defaults, mobility runs on vtep2..vtep7 (6 mobility-eligible hosts)
-- A static controller endpoint named controller is created on host1
+- `vtep1` is the controller/static VTEP (`CONTROLLER_VTEPS = {"vtep1"}`)
+- controller VTEPs participate in the topology/control-plane
+- controller VTEPs are excluded from mobile endpoint placement and migration
+- controller endpoint is created on `host1` as:
+  - interface: `controller`
+  - IP: `192.168.100.254/16`
+  - MAC: `00:aa:bb:dd:00:01`
 
-Guardrails enforced by assertions:
+Guardrails in test logic:
 
-- At least one mobility-eligible host must exist
-- At least two mobility-eligible VTEPs must exist
+- at least one mobility-eligible host must exist
+- at least two mobility-eligible VTEPs must exist
 
 ## Topology and Addressing
 
@@ -37,183 +39,119 @@ Topology:
                host1 host2 host3 host4 host5 host6 host7
 ```
 
-Addressing summary:
+Addressing:
 
-- VTEP VXLAN local source IPs: {10*i}.{10*i}.{10*i}.{10*i} for VTEP i
+- VTEP VXLAN source IP for `vtep{i}`: `{10*i}.{10*i}.{10*i}.{10*i}`
 - SVI IPs:
-  - vtep1..vtep5: 192.168.0.251..192.168.0.255
-  - vtep6+: 192.168.200.x
-- Anycast gateway on all VTEPs: 192.168.0.250/16
-- Host IPs (host1..host7): 192.168.0.1/16 .. 192.168.0.7/16
-- Mobile VM IPs: 192.168.100.1/16 .. 192.168.100.128/16
-- Controller endpoint:
-  - Host: host1
-  - Iface: controller
-  - IP: 192.168.100.254/16
-  - MAC: 00:aa:bb:dd:00:01
+  - `vtep1..vtep5`: `192.168.0.251..192.168.0.255`
+  - `vtep6+`: `192.168.200.{vtep_index-5}`
+- Anycast gateway on each VTEP bridge: `192.168.0.250/16`
+- Host underlay-facing IPs for `host1..host7`: `192.168.0.1/16 .. 192.168.0.7/16`
+- Mobile VM IP pool: `192.168.100.1/16 .. 192.168.100.64/16` (default count)
 
-## Test Phases (Current Behavior)
+## Test Phases
 
-### Phase 1: Deployment
+### Phase 1: Deploy mobile endpoints
 
-- Deploy 128 VM endpoints (vm1..vm128)
-- Round-robin placement across mobility-eligible hosts only
-- Pause every 5 endpoints, then stabilization sleep
+- create `NUM_MOBILE_VMS` MACVLAN endpoints
+- place endpoints round-robin across mobility-eligible hosts only
+- pause every 5 VMs, then wait 3 seconds for settling
 
-### Phase 2: Initial Reachability
+### Phase 2: Initial connectivity check (optional)
 
-- If controller ping checks are enabled, controller endpoint pings every VM IP
-- Progress and failures are printed; phase asserts on any failure
-- If disabled, phase logs that checks are skipped
+- if `ENABLE_CONTROLLER_PING_CHECKS` is `True`, controller endpoint pings every VM IP
+- if disabled (default), phase logs that checks are skipped
 
-### Phase 3: Batched Live Migration
+### Phase 3: Batched live migration
 
-Migration is now batched (default batch size 5):
+For each batch:
 
-1. Build migration plan for batch members
-2. Create destination endpoints for the whole batch
-3. Sleep overlap timer once per batch (duplicate-MAC window)
-4. Delete source endpoints for the whole batch
-5. Update in-memory VM location mapping
-6. Optional settle sleep between batches
+1. build migration plans
+2. create destination endpoints for the whole batch
+3. sleep overlap timer once (`MOBILITY_OVERLAP_SECONDS`)
+4. delete source endpoints for the whole batch
+5. update in-memory VM location map
+6. optional inter-batch settle sleep (`MIGRATION_BATCH_SETTLE_SECONDS`)
 
-Safety mode (enabled by default):
+Safety rollback behavior:
 
-- If destination creation fails partway through a batch, already-created destinations are rolled back before the error is re-raised
-- Warning lines are printed when rollback or forced cleanup is triggered
-- If source delete appears incomplete, forced idempotent cleanup is attempted and logged
+- if destination creation fails mid-batch and rollback is enabled, already-created destination endpoints in that batch are deleted before re-raising
+- if source deletion appears incomplete, idempotent forced cleanup is attempted
 
-### Phase 4: Post-Migration Reachability
+### Phase 4: Post-migration connectivity check (optional)
 
-- Same controller-to-VM sweep behavior as phase 2 (gated by the same toggle)
+- same controller-to-VM sweep behavior as phase 2
 
-## Packet Captures and Reporting
+## Packet Captures and Teardown Summary
 
-The test starts two captures:
+Captures started during the test:
 
-- spine1 capture:
-  - File: {logdir}/spine1/evpn_mobility.pcap
-  - Filter: tcp port 179
-- controller VTEP capture (vtep1 by default):
-  - File: {logdir}/vtep1/evpn_controller_mobility.pcap
-  - Filter: tcp port 179 or udp port 4789 or arp
+- spine capture
+  - node: `spine1`
+  - file: `{logdir}/spine1/spine1_evpn_mobility.pcap`
+  - filter: `tcp port 179`
+- vtep capture
+  - node: `vtep2`
+  - file: `{logdir}/vtep2/vtep2_evpn_mobility.pcap`
+  - filter: `tcp port 179`
+- controller-VTEP capture
+  - node: current controller VTEP (default `vtep1`)
+  - file: `{logdir}/{controller_vtep}/{controller_vtep}_evpn_controller_mobility.pcap`
+  - filter: `tcp port 179`
 
-At teardown, the test prints:
+Teardown summary prints, per capture:
 
-- pcap file path
-- pcap size (human-readable binary units)
-- packet count
+- capture file path
+- packet count status from `get_pcap_packet_count()`:
+  - numeric count
+  - `skipped` (if file is larger than threshold)
+  - `missing` (if file was not created)
 
-Packet-count auto-threshold:
+Then the test sleeps 5 seconds before continuing cleanup output.
 
-- packet counting is skipped for files larger than configured threshold
-- output format: skipped(>X MiB/GiB)
+## Configuration and Environment Knobs
 
-## Configurable Settings and Environment Variables
+### In-code constants
 
-### In-code settings (edit test file)
+- `NUM_VTEPS = 7`
+- `NUM_HOSTS = 7`
+- `NUM_MOBILE_VMS = 64`
+- `CONTROLLER_VTEPS = {"vtep1"}`
+- `ENABLE_CONTROLLER_PING_CHECKS = False`
 
-- NUM_VTEPS = 7
-- NUM_HOSTS = 7
-- NUM_MOBILE_VMS = 128
-- CONTROLLER_VTEPS = {"vtep1"}
-- ENABLE_CONTROLLER_PING_CHECKS = False
+### Environment variables consumed by the test
 
-### Environment variables
+- `MOBILITY_OVERLAP_SECONDS`
+  - default: `0.2`
+- `MIGRATION_BATCH_SIZE`
+  - default: `1`
+- `MIGRATION_BATCH_SETTLE_SECONDS`
+  - default: `0.2`
+- `ENABLE_MIGRATION_BATCH_SAFETY_ROLLBACK`
+  - default: `true`
+- `PCAP_PACKET_COUNT_MAX_BYTES`
+  - default: `1073741824` (1 GiB)
+- `MUNET_CLI`
+  - set to `1` to drop into `munet>` CLI at test end
 
-- MOBILITY_OVERLAP_SECONDS
-  - Default: 0.3
-  - Purpose: duplicate-MAC overlap duration per migration batch
-- MIGRATION_BATCH_SIZE
-  - Default: 5
-  - Purpose: number of VMs moved together in phase 3
-- MIGRATION_BATCH_SETTLE_SECONDS
-  - Default: 0.0
-  - Purpose: optional delay between migration batches
-- ENABLE_MIGRATION_BATCH_SAFETY_ROLLBACK
-  - Default: true
-  - Purpose: rollback partial destination creates on batch failure
-- PCAP_PACKET_COUNT_MAX_BYTES
-  - Default: 1073741824 (1 GiB)
-  - Purpose: max file size for packet counting; above this, count is skipped
-- MUNET_CLI
-  - Default: unset
-  - Use 1 to drop into munet CLI at end of test
+Note: `ENABLE_CONTROLLER_PING_CHECKS` is currently a code constant, not an environment variable.
 
-## Optional Quick-Run Examples (Hypothetical)
-
-These are optional examples to illustrate how knobs can be combined. They are not required for normal runs.
-
-- Baseline-like run (current defaults):
+## Run Example
 
 ```bash
 PYTEST_XDIST_MODE=no \
 python3 -m pytest -s test_evpn_capstone.py::test_mobility
 ```
-
-- Faster migration stress (larger batches, no settle delay):
-
-```bash
-PYTEST_XDIST_MODE=no \
-MIGRATION_BATCH_SIZE=10 \
-MIGRATION_BATCH_SETTLE_SECONDS=0 \
-python3 -m pytest -s test_evpn_capstone.py::test_mobility
-```
-
-- Conservative timing (smaller batches, larger overlap):
-
-```bash
-PYTEST_XDIST_MODE=no \
-MIGRATION_BATCH_SIZE=3 \
-MOBILITY_OVERLAP_SECONDS=0.5 \
-python3 -m pytest -s test_evpn_capstone.py::test_mobility
-```
-
-- Enable controller reachability sweeps during phase 2/4:
-
-```bash
-PYTEST_XDIST_MODE=no \
-ENABLE_CONTROLLER_PING_CHECKS=true \
-python3 -m pytest -s test_evpn_capstone.py::test_mobility
-```
-
-- Keep packet counting only for small captures (e.g., <= 512 MiB):
-
-```bash
-PYTEST_XDIST_MODE=no \
-PCAP_PACKET_COUNT_MAX_BYTES=$((512*1024*1024)) \
-python3 -m pytest -s test_evpn_capstone.py::test_mobility
-```
-
-- Disable batch safety rollback (not recommended except targeted debugging):
-
-```bash
-PYTEST_XDIST_MODE=no \
-ENABLE_MIGRATION_BATCH_SAFETY_ROLLBACK=false \
-python3 -m pytest -s test_evpn_capstone.py::test_mobility
-```
-
-## Change Log (Recent)
-
-- Added controller/static VTEP role and static controller endpoint model
-- Added optional controller-to-VM ping sweeps with progress output
-- Added migration overlap timer configuration
-- Added batched migration flow for faster execution
-- Added batch safety rollback and warning logging for partial failures
-- Added dual packet capture (spine and controller VTEP)
-- Added teardown summary with pcap size and packet count
-- Added packet-count auto-threshold with human-readable skip reason
-- Added shell path quoting for capture/stat commands
 
 ## Operational Notes
 
-- Full runtime execution should be done in the intended FRR topotest environment/container
-- Capture output depends on tcpdump starting successfully inside each relevant node namespace
+- run in the intended FRR topotest/container environment
+- capture files exist only if `tcpdump` starts successfully in each node namespace
 
 ## Debugging Checklist
 
-1. show evpn mac vni 1000
-2. show bgp l2vpn evpn
-3. bridge fdb show
-4. Validate VNI/VXLAN state and BGP neighbor state
-5. Inspect both pcap files with Wireshark/tshark
+1. `show evpn mac vni 1000`
+2. `show bgp l2vpn evpn`
+3. `bridge fdb show`
+4. validate VNI/VXLAN state and BGP sessions
+5. inspect capture files with Wireshark/tshark
