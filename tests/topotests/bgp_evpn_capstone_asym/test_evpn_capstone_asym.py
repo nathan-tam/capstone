@@ -2,7 +2,7 @@
 # -*- coding: utf-8 eval: (blacken-mode 1) -*-
 # SPDX-License-Identifier: ISC
 #
-# test_evpn_capstone.py
+# test_evpn_capstone_asym.py
 # Part of NetDEF Topology Tests
 #
 # Copyright (c) 2017 by
@@ -56,9 +56,9 @@ CONTROLLER_ENDPOINT_MAC = "00:aa:bb:dd:00:01"
 # Set to False to skip controller reachability sweeps while keeping mobility logic unchanged.
 ENABLE_CONTROLLER_PING_CHECKS = False
 
-# Always-on checks for hub/spoke EVPN policy in the asym topology:
+# Policy checks for hub/spoke EVPN behavior in the asym topology:
 # - selected mobile VMs must reach controller endpoint
-# - selected mobile VMs on different spokes must not reach each other directly
+# - selected mobile VMs on different spokes should not reach each other directly
 ENABLE_ASYMMETRIC_POLICY_CHECKS = True
 # Set to False to skip only the spoke-to-spoke isolation assertion.
 # This is useful when testing other features even if inter-spoke connectivity exists.
@@ -105,27 +105,6 @@ except ValueError:
     PCAP_PACKET_COUNT_MAX_BYTES = 1024 * 1024 * 1024
 
 
-def format_binary_size(num_bytes):
-    """Format bytes into human-readable binary units (KiB, MiB, GiB...)."""
-    units = ["B", "KiB", "MiB", "GiB", "TiB"]
-    size = float(max(0, num_bytes))
-    unit_idx = 0
-    while size >= 1024.0 and unit_idx < len(units) - 1:
-        size /= 1024.0
-        unit_idx += 1
-    if unit_idx == 0:
-        return f"{int(size)} {units[unit_idx]}"
-    return f"{size:.1f} {units[unit_idx]}"
-
-
-def get_file_size_bytes(node, file_path):
-    """Return file size in bytes as string, or 'missing' if file does not exist."""
-    path = shlex.quote(file_path)
-    return node.run(
-        "if [ -f {0} ]; then stat -c%s {0}; else echo missing; fi".format(path)
-    ).strip()
-
-
 def get_pcap_packet_count(node, file_path, max_bytes):
     """Return packet count, or 'skipped'/'missing' based on file state and threshold."""
     path = shlex.quote(file_path)
@@ -135,14 +114,6 @@ def get_pcap_packet_count(node, file_path, max_bytes):
             max_bytes,
         )
     ).strip()
-
-
-def format_packet_count(packet_count_value, max_bytes):
-    """Format packet-count summary value for reporting."""
-    if packet_count_value == "skipped":
-        return f"skipped(>{format_binary_size(max_bytes)})"
-    return packet_count_value
-
 
 def macvlan_endpoint_exists(tgen, host_name, vm_name):
     """Return True when endpoint interface exists on the host."""
@@ -713,7 +684,7 @@ def test_mobility(tgen):
     source delete) to stress EVPN control-plane convergence.
 
     Steps:
-    1. Deploy 128 VMs distributed across hosts (one per VTEP)
+    1. Deploy mobile VMs distributed across hosts (one per VTEP)
     2. Verify controller endpoint can reach all VM IPs at initial locations
     3. Live-migrate each VM to a different VTEP (brief duplicate-MAC window)
     4. Verify controller endpoint can still reach all VM IPs after migration
@@ -742,7 +713,6 @@ def test_mobility(tgen):
     print(f"Migration batch size: {MIGRATION_BATCH_SIZE}")
     print(f"Batch settle timer: {MIGRATION_BATCH_SETTLE_SECONDS:.3f}s")
     print(f"Batch safety rollback: {ENABLE_MIGRATION_BATCH_SAFETY_ROLLBACK}")
-    print(f"Packet count threshold: {format_binary_size(PCAP_PACKET_COUNT_MAX_BYTES)}")
     
     spine = tgen.gears["spine1"]                                # Run packet capture on spine1.
     pcap_dir = os.path.join(tgen.logdir, "spine1")              # Store output in the test log directory.
@@ -811,7 +781,7 @@ def test_mobility(tgen):
         
         # Create mobile endpoints and record initial placement.
         for vm_idx in range(1, NUM_MOBILE_VMS + 1):
-            # VM naming scheme: vm1, vm2, ..., vm128.
+            # VM naming scheme: vm1, vm2, ..., vmN.
             vm_name = f"vm{vm_idx}"
             
             # Use 192.168.100.x for mobile VMs (up to 254 VMs).
@@ -908,15 +878,6 @@ def test_mobility(tgen):
         )
         spine.run("sleep 1")
 
-        spine_pcap_size_bytes = get_file_size_bytes(spine, pcap_file)
-        controller_pcap_size_bytes = get_file_size_bytes(
-            controller_vtep,
-            controller_pcap_file,
-        )
-        vtep2_pcap_size_bytes = get_file_size_bytes(
-            vtep2,
-            vtep2_pcap_file,
-        )
         spine_pcap_packets = get_pcap_packet_count(
             spine,
             pcap_file,
@@ -933,45 +894,19 @@ def test_mobility(tgen):
             PCAP_PACKET_COUNT_MAX_BYTES,
         )
 
-        spine_pcap_size_display = (
-            "missing"
-            if spine_pcap_size_bytes == "missing"
-            else format_binary_size(int(spine_pcap_size_bytes))
-        )
-        controller_pcap_size_display = (
-            "missing"
-            if controller_pcap_size_bytes == "missing"
-            else format_binary_size(int(controller_pcap_size_bytes))
-        )
-        vtep2_pcap_size_display = (
-            "missing"
-            if vtep2_pcap_size_bytes == "missing"
-            else format_binary_size(int(vtep2_pcap_size_bytes))
-        )
-
-        spine_pcap_packets_display = format_packet_count(
-            spine_pcap_packets,
-            PCAP_PACKET_COUNT_MAX_BYTES,
-        )
-        controller_pcap_packets_display = format_packet_count(
-            controller_pcap_packets,
-            PCAP_PACKET_COUNT_MAX_BYTES,
-        )
-        vtep2_pcap_packets_display = format_packet_count(
-            vtep2_pcap_packets,
-            PCAP_PACKET_COUNT_MAX_BYTES,
-        )
-
         print("Packet captures saved:")
         print(
-            f"  spine1: {pcap_file} ({spine_pcap_size_display}, packets={spine_pcap_packets_display})"
+            f"  spine1: {pcap_file} (packets={spine_pcap_packets})"
         )
         print(
-            f"  vtep2: {vtep2_pcap_file} ({vtep2_pcap_size_display}, packets={vtep2_pcap_packets_display})"
+            f"  vtep2: {vtep2_pcap_file} (packets={vtep2_pcap_packets})"
         )
         print(
-            f"  {controller_vtep_name}: {controller_pcap_file} ({controller_pcap_size_display}, packets={controller_pcap_packets_display})"
+            f"  {controller_vtep_name}: {controller_pcap_file} (packets={controller_pcap_packets})"
         )
+
+        # Brief pause to keep capture summary visible before subsequent output.
+        sleep(5)
 
         # Remove controller endpoint to keep test namespace clean.
         delete_macvlan_endpoint_if_exists(
