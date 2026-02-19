@@ -213,7 +213,7 @@ def migrate_macvlan_endpoints_live_batch(tgen, migration_batch):
             )
 
 vtep_ips = {
-    f"vtep{i}": f"{10*i}.{10*i}.{10*i}.{10*i}" 
+    f"vtep{i}": f"192.168.100.{14 + i}"
     for i in range(1, NUM_VTEPS + 1)
 }
 

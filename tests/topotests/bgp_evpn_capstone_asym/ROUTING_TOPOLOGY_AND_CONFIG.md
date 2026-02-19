@@ -1,196 +1,199 @@
-# EVPN Asymmetric Capstone: Topology, Routing Intent, and Config Summary
+# EVPN Asymmetric Capstone: Topology and Routing Guide
 
-This document explains how the topology is intended to work and what the current configs implement in `tests/topotests/bgp_evpn_capstone_asym`.
+This guide explains what the `bgp_evpn_capstone_asym` test builds, how routing is intended to work, and what to check when behavior is unexpected.
 
-It is written for readers comfortable with networking fundamentals, but not necessarily deep BGP/EVPN internals.
+Target reader: someone familiar with basic IP routing, but new to this specific topology.
 
-## 1) What this topology is trying to achieve
+## 1) Quick-start snapshot (read this first)
 
-The asym test models a **hub-and-spoke EVPN control plane**:
+### Roles and RTs at a glance
 
-- `vtep1` is the **hub** VTEP.
-- `vtep2` through `vtep7` are **spoke** VTEPs.
-- Spokes should learn hub endpoints.
-- Hub should learn spoke endpoints.
-- Spokes should not directly learn each other’s endpoint routes.
+```text
+                           +------------------------------+
+                           | spine1 + spine2 (AS 65001)  |
+                           | Transit EVPN policy nodes    |
+                           +---------------+--------------+
+                                           |
+                      -------------------------------------------------
+                      |                    |                          |
+                 Hub VTEP             Spoke VTEPs                Hosts
+               vtep1 (AS 65011)      vtep2..vtep7               host1..host7
+               export RT 1000        export RT 1002..1007       one per VTEP
+               import RT 1000,       import RT 1000 only
+               1002..1007
+```
 
-In practical terms: endpoint reachability is intended to be mediated by the hub route-target policy, instead of full spoke-to-spoke route exchange.
+### Who learns what
 
-## 2) Physical/logical topology built by the test
+| Origin route RT | Learned by hub (`vtep1`) | Learned by spokes (`vtep2..vtep7`) |
+| --- | --- | --- |
+| `65000:1000` (hub routes) | Yes | Yes |
+| `65000:1002..1007` (spoke routes) | Yes | No |
 
-From `test_evpn_capstone_asym.py` (`build_topo()`):
+### Spine forwarding policy summary
+
+- To hub neighbor: `EVPN-TO-HUB out` (permit all EVPN routes)
+- To spoke neighbors: `EVPN-TO-SPOKE out` (permit only RT `65000:1000`)
+
+## 2) Quick intent (what “asymmetric” means here)
+
+The test models a **hub-and-spoke EVPN control plane**:
+
+- `vtep1` is the hub (controller-side VTEP).
+- `vtep2` to `vtep7` are spokes.
+- Hub learns spoke routes.
+- Spokes learn hub routes.
+- Spokes should not learn each other’s spoke-tagged EVPN routes.
+
+In short: route visibility is intentionally one-to-many via the hub policy, not full mesh.
+
+## 3) Topology built by the test
+
+`build_topo()` in `test_evpn_capstone_asym.py` creates:
 
 - 2 spines: `spine1`, `spine2`
 - 7 VTEPs: `vtep1..vtep7`
 - 7 hosts: `host1..host7`
-- Each VTEP has one link to each spine
-- Each host is attached to exactly one VTEP
+- Every VTEP connects to both spines.
+- Every host connects to exactly one VTEP (round-robin; with 7/7 it is effectively 1:1).
 
-High-level layout:
+Layout:
 
 ```text
-                     spine1 ---------------- spine2
-                    /  |  |  |  |  |  \     /  |  |  |  |  |  \
-               vtep1 vtep2 vtep3 vtep4 vtep5 vtep6 vtep7
-                 |     |     |     |     |     |     |
-               host1 host2 host3 host4 host5 host6 host7
+                    spine1                           spine2
+                      |  \                         /  |
+                      |   \                       /   |
+          ---------------------------------------------------------
+          |      |      |      |      |      |      |
+        vtep1  vtep2  vtep3  vtep4  vtep5  vtep6  vtep7
+          |      |      |      |      |      |      |
+        host1  host2  host3  host4  host5  host6  host7
 ```
 
-## 3) Underlay routing model (IPv4 unicast eBGP)
+## 4) Underlay BGP (IPv4 unicast)
 
-All BGP adjacencies are eBGP (`remote-as external`) between each VTEP and both spines.
+- eBGP everywhere between VTEPs and spines (`remote-as external`).
+- Spines are pure transit/filter nodes in this test.
 
-### Spine loopbacks / router IDs
+### Spine identities
 
-- `spine1`: loopback `192.168.100.13` (BGP router-id `192.168.100.13`)
-- `spine2`: loopback `192.168.100.14` (BGP router-id `192.168.100.14`)
+- `spine1`: router-id / loopback `192.168.100.13`
+- `spine2`: router-id / loopback `192.168.100.14`
 
-### Point-to-point subnets used for spine↔VTEP links
+### Spine-facing link IPs
 
-From `spine1/zebra.conf` and `spine2/zebra.conf`:
+From spine `zebra.conf`:
 
-- Spine1 side: `192.168.1.1`, `2.1`, `3.1`, `4.1`, `9.1`, `11.1`, `13.1`
-- Spine2 side: `192.168.5.1`, `6.1`, `7.1`, `8.1`, `10.1`, `12.1`, `14.1`
+- `spine1` uses: `192.168.1.1`, `2.1`, `3.1`, `4.1`, `9.1`, `11.1`, `13.1`
+- `spine2` uses: `192.168.5.1`, `6.1`, `7.1`, `8.1`, `10.1`, `12.1`, `14.1`
 
-VTEP neighbors use the `.1` addresses above, and spines peer to corresponding VTEP `.2` addresses.
+VTEPs peer to these `.1` addresses; spines peer to VTEP `.2` addresses.
 
-## 4) EVPN control-plane model
+## 5) EVPN configuration model on VTEPs
 
-Each VTEP enables:
+All VTEPs use:
 
 - `address-family l2vpn evpn`
-- `advertise-all-vni`
+- `neighbor TRANSIT_OVERLAY activate`
 - `advertise-svi-ip`
-- VNI `1000` with explicit `rd` and RT import/export policy
+- explicit `vni 1000` block with manual RD/RTs
 
-### Hub/spoke RT policy on VTEPs
+### Important nuance: `advertise-all-vni` is not uniform
 
-Route-target behavior from VTEP `evpn.conf` files:
+- `vtep1` and `vtep2` explicitly configure `no advertise-all-vni`.
+- `vtep3` to `vtep7` currently have `advertise-all-vni` present.
 
-- **Hub (`vtep1`)**
-  - exports: `RT 65000:1000`
-  - imports: `RT 65000:1000`, `65000:1002`, `65000:1003`, `65000:1004`, `65000:1005`, `65000:1006`, `65000:1007`
+Because all nodes still define explicit `vni 1000` with manual RTs, the service intent remains hub/spoke. This mixed style is worth remembering when troubleshooting.
 
-- **Spokes (`vtep2..vtep7`)**
-  - each spoke exports its own RT:
-    - `vtep2` -> `65000:1002`
-    - `vtep3` -> `65000:1003`
-    - `vtep4` -> `65000:1004`
-    - `vtep5` -> `65000:1005`
-    - `vtep6` -> `65000:1006`
-    - `vtep7` -> `65000:1007`
-  - each spoke imports only `RT 65000:1000` (hub RT)
+### RT policy by role
 
-This means spokes are configured to learn hub-labeled EVPN routes, not each other’s spoke-labeled routes.
+- Hub (`vtep1`):
+  - export `65000:1000`
+  - import `65000:1000` and `65000:1002..65000:1007`
+- Spokes:
+  - `vtep2` export `65000:1002`, import `65000:1000`
+  - `vtep3` export `65000:1003`, import `65000:1000`
+  - `vtep4` export `65000:1004`, import `65000:1000`
+  - `vtep5` export `65000:1005`, import `65000:1000`
+  - `vtep6` export `65000:1006`, import `65000:1000`
+  - `vtep7` export `65000:1007`, import `65000:1000`
 
-## 5) Spine EVPN export filtering policy
+## 6) Spine policy that enforces asymmetry
 
-Both spines apply outbound EVPN route-maps by neighbor in `address-family l2vpn evpn`.
+Both spines currently include:
 
-Shared policy objects on both spines:
+- `bgp retain-route-target all`
+- `neighbor TRANSIT_OVERLAY send-community extended`
+- EVPN `neighbor TRANSIT_OVERLAY next-hop-unchanged`
 
-- `bgp extcommunity-list standard EVPN-HUB-RT permit rt 65000:1000`
-- `bgp extcommunity-list standard EVPN-SPOKE-RTS permit rt 65000:1002 ... rt 65000:1007`
+Both spines also define:
+
+- extcommunity list `EVPN-HUB-RT` = `rt 65000:1000`
+- extcommunity list `EVPN-SPOKE-RTS` = `rt 65000:1002..65000:1007`
 
 Route-maps:
 
-- `EVPN-TO-HUB`
-  - `permit 10 match extcommunity EVPN-SPOKE-RTS any`
-  - `deny 20`
-- `EVPN-TO-SPOKE`
-  - `permit 10 match extcommunity EVPN-HUB-RT any`
-  - `deny 20`
+- `EVPN-TO-HUB permit 10` (match-all; hub receives all EVPN routes)
+- `EVPN-TO-SPOKE permit 10 match extcommunity EVPN-HUB-RT`
+- `EVPN-TO-SPOKE deny 20`
 
-Neighbor attachment:
+Neighbor bindings:
 
-- On each spine, hub-facing neighbor gets `EVPN-TO-HUB`
-- All spoke-facing neighbors get `EVPN-TO-SPOKE`
+- hub-facing neighbor (`vtep1`) uses `EVPN-TO-HUB out`
+- all spoke-facing neighbors use `EVPN-TO-SPOKE out`
 
-Resulting intent:
+## 7) Route flow examples
 
-- Hub receives spoke RT routes
-- Spokes receive only hub RT routes
-- Spoke RT routes are not propagated to other spokes by the spine policy
+### A) Spoke endpoint (`vtep3`) advertisement
 
-## 6) BGP advertisement flow (step-by-step)
+1. `vtep3` advertises EVPN route with RT `65000:1003`.
+2. Both spines receive it.
+3. Spines advertise it to hub (hub neighbor uses `EVPN-TO-HUB`).
+4. Spines do not advertise it to other spokes (`EVPN-TO-SPOKE` only allows `65000:1000`).
+5. Hub imports it (`vtep1` imports `65000:1003`).
 
-This section focuses on how EVPN advertisements are expected to flow in this design.
+### B) Hub endpoint (`vtep1`) advertisement
 
-### Flow A: a spoke endpoint is advertised
+1. `vtep1` advertises EVPN route with RT `65000:1000`.
+2. Both spines receive it.
+3. Spines advertise it to spokes (`EVPN-TO-SPOKE` permits hub RT).
+4. Spokes import it (all spokes import `65000:1000`).
 
-Example: endpoint is on `vtep3`.
+## 8) Data-plane setup in the test harness
 
-1. `vtep3` originates EVPN routes for that endpoint under VNI 1000.
-1. `vtep3` exports those routes with RT `65000:1003`.
-1. Both spines receive the route from `vtep3`.
-1. Toward the hub neighbor on each spine, `EVPN-TO-HUB` is applied and permits RTs in `EVPN-SPOKE-RTS` (`65000:1002..1007`), so the route is sent to `vtep1`.
-1. Toward spoke neighbors on each spine, `EVPN-TO-SPOKE` is applied and permits only RT `65000:1000`, so the spoke-origin RT `65000:1003` route is not sent to other spokes.
-1. `vtep1` imports RT `65000:1003` and installs the route; other spokes do not receive it from spines in this policy.
+`config_l2vni()` / `config_vtep()` build on each VTEP:
 
-### Flow B: a hub endpoint is advertised
+- bridge `br1000`
+- VXLAN interface `vni1000` (UDP 4789, VNI 1000)
+- anycast gateway `192.168.0.250/16` on `br1000`
+- host-facing bond `hostbond1` attached to `br1000` (VLAN 1000)
 
-Example: endpoint is on `vtep1`.
+Each host uses `vtepbond`; mobile endpoints are MACVLAN interfaces created/deleted during migration.
 
-1. `vtep1` originates EVPN routes and exports RT `65000:1000`.
-2. Both spines receive the route from `vtep1`.
-3. Toward spoke neighbors, spines apply `EVPN-TO-SPOKE`.
-4. `EVPN-TO-SPOKE` permits RT `65000:1000`, so hub-origin routes are advertised to spokes.
-5. Each spoke imports RT `65000:1000`, so spoke VTEPs learn hub-origin routes.
+## 9) Test behavior details that matter
 
-### Flow C: why spoke-to-spoke route distribution is blocked
+From `test_evpn_capstone_asym.py`:
 
-- Spoke-origin routes carry RTs `65000:1002..1007`.
-- Spines only advertise those RTs to the hub (`EVPN-TO-HUB`).
-- Spoke-facing advertisements are restricted to RT `65000:1000` (`EVPN-TO-SPOKE`).
-- Therefore, a spoke does not learn another spoke’s endpoint routes through the spines.
+- `CONTROLLER_VTEPS = {"vtep1"}` (hub/controller side is fixed)
+- `NUM_MOBILE_VMS = 64`
+- default `ENABLE_ASYMMETRIC_POLICY_CHECKS = True`
+- default `ENFORCE_SPOKE_TO_SPOKE_ISOLATION = False`
 
-## 7) Node identity summary (from current `evpn.conf`)
+So by default, the test actively checks controller↔VM reachability, but does not fail if sampled spoke↔spoke ping succeeds unless isolation enforcement is enabled.
 
-- `spine1`: ASN `65001`, router-id `192.168.100.13`, transit/filter node
-- `spine2`: ASN `65001`, router-id `192.168.100.14`, transit/filter node
-- `vtep1`: ASN `65011`, router-id `192.168.100.15`, hub
-- `vtep2`: ASN `65012`, router-id `192.168.100.16`, spoke
-- `vtep3`: ASN `65021`, router-id `192.168.100.17`, spoke
-- `vtep4`: ASN `65022`, router-id `192.168.100.18`, spoke
-- `vtep5`: ASN `65023`, router-id `192.168.100.19`, spoke
-- `vtep6`: ASN `65024`, router-id `192.168.100.20`, spoke
-- `vtep7`: ASN `65025`, router-id `192.168.100.21`, spoke
+## 10) Fast troubleshooting checklist
 
-## 8) Data-plane construction done by the test code
-
-From `config_l2vni()` and `config_vtep()` in `test_evpn_capstone_asym.py`:
-
-- each VTEP builds bridge `br1000`
-- VTEP SVI IP is assigned to `br1000`
-- anycast gateway `192.168.0.250/16` is assigned to `br1000`
-- VXLAN device `vni1000` (UDP 4789, ID 1000) is attached to `br1000`
-- host-facing bond `hostbond1` is attached to `br1000` and placed in VLAN 1000
-
-Hosts use `vtepbond`, and mobile endpoints are created as MACVLAN interfaces on top of that bond.
-
-## 9) Why this is “asymmetric” behavior
-
-In a full-mesh EVPN import/export design, every VTEP would typically import the same service RT(s), allowing direct spoke-to-spoke endpoint route learning.
-
-Here, the config intentionally does not do that:
-
-- spokes only import hub RT `65000:1000`
-- spines only send spoke RT routes toward hub, not toward other spokes
-
-So control-plane route visibility is intentionally asymmetric (hub sees all spokes; each spoke mainly sees hub scope).
-
-## 10) Quick validation commands
-
-Useful checks while troubleshooting:
+Run these on relevant nodes:
 
 - `show bgp l2vpn evpn summary`
 - `show bgp l2vpn evpn route`
 - `show evpn mac vni 1000`
-- `show running-config` (confirm route-map attachment per spine neighbor)
+- `show running-config` (verify route-map neighbor attachments)
 - `bridge fdb show`
 
-If behavior differs from intent, first verify:
+If results do not match intent, check in this order:
 
-1. EVPN neighbor sessions are established on both spines.
-2. Spine route-map bindings are on the correct hub vs spoke neighbors.
-3. VTEP import/export RT lines match the intended role.
+1. EVPN sessions up on both spine links for every VTEP.
+2. Hub neighbor vs spoke neighbors have the correct outbound route-map.
+3. RT import/export lines are correct for each VTEP role.
+4. Underlay reachability to EVPN next-hop loopbacks (`192.168.100.15..21`).
