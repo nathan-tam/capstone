@@ -95,23 +95,12 @@ ENABLE_MIGRATION_BATCH_SAFETY_ROLLBACK = (
     not in {"0", "false", "no", "off"}
 )
 
-# Auto-threshold for post-test pcap packet counting.
-# Packet counting is skipped when a pcap exceeds this size (bytes).
-try:
-    PCAP_PACKET_COUNT_MAX_BYTES = max(
-        0, int(os.getenv("PCAP_PACKET_COUNT_MAX_BYTES", str(1024 * 1024 * 1024)))
-    )
-except ValueError:
-    PCAP_PACKET_COUNT_MAX_BYTES = 1024 * 1024 * 1024
-
-
-def get_pcap_packet_count(node, file_path, max_bytes):
-    """Return packet count, or 'skipped'/'missing' based on file state and threshold."""
+def get_pcap_packet_count(node, file_path):
+    """Return packet count, or 'missing' when the pcap does not exist."""
     path = shlex.quote(file_path)
     return node.run(
-        "if [ -f {0} ]; then size=$(stat -c%s {0}); if [ \"$size\" -le {1} ]; then tcpdump -nr {0} 2>/dev/null | wc -l; else echo skipped; fi; else echo missing; fi".format(
-            path,
-            max_bytes,
+        "if [ -f {0} ]; then tcpdump -nr {0} 2>/dev/null | wc -l; else echo missing; fi".format(
+            path
         )
     ).strip()
 
@@ -881,17 +870,14 @@ def test_mobility(tgen):
         spine_pcap_packets = get_pcap_packet_count(
             spine,
             pcap_file,
-            PCAP_PACKET_COUNT_MAX_BYTES,
         )
         controller_pcap_packets = get_pcap_packet_count(
             controller_vtep,
             controller_pcap_file,
-            PCAP_PACKET_COUNT_MAX_BYTES,
         )
         vtep2_pcap_packets = get_pcap_packet_count(
             vtep2,
             vtep2_pcap_file,
-            PCAP_PACKET_COUNT_MAX_BYTES,
         )
 
         print("Packet captures saved:")

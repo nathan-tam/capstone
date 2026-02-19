@@ -104,7 +104,6 @@ Teardown summary prints, per capture:
 - capture file path
 - packet count status from `get_pcap_packet_count()`:
   - numeric count
-  - `skipped` (if file is larger than threshold)
   - `missing` (if file was not created)
 
 Then the test sleeps 5 seconds before continuing cleanup output.
@@ -129,8 +128,6 @@ Then the test sleeps 5 seconds before continuing cleanup output.
   - default: `0.2`
 - `ENABLE_MIGRATION_BATCH_SAFETY_ROLLBACK`
   - default: `true`
-- `PCAP_PACKET_COUNT_MAX_BYTES`
-  - default: `1073741824` (1 GiB)
 - `MUNET_CLI`
   - set to `1` to drop into `munet>` CLI at test end
 
