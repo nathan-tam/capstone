@@ -9,7 +9,7 @@ The test validates EVPN MAC mobility behavior by creating endpoints, migrating t
 - 7 VTEPs
 - 2 spines
 - 7 hosts (one per VTEP)
-- 64 mobile VM endpoints (`vm1..vm64`)
+- 20 mobile VM endpoints (`vm1..vm20`)
 
 Controller model:
 
@@ -48,7 +48,7 @@ Addressing:
   - `vtep6+`: `192.168.200.{vtep_index-5}`
 - Anycast gateway on each VTEP bridge: `192.168.0.250/16`
 - Host underlay-facing IPs for `host1..host7`: `192.168.0.1/16 .. 192.168.0.7/16`
-- Mobile VM IP pool: `192.168.100.1/16 .. 192.168.100.64/16` (default count)
+- Mobile VM IP pool: `192.168.100.1/16 .. 192.168.100.20/16` (default count)
 
 ## Test Phases
 
@@ -58,10 +58,9 @@ Addressing:
 - place endpoints round-robin across mobility-eligible hosts only
 - pause every 5 VMs, then wait 3 seconds for settling
 
-### Phase 2: Initial connectivity check (optional)
+### Phase 2: Post-deployment settle
 
-- if `ENABLE_CONTROLLER_PING_CHECKS` is `True`, controller endpoint pings every VM IP
-- if disabled (default), phase logs that checks are skipped
+- logs deployment completion and proceeds to migration
 
 ### Phase 3: Batched live migration (repeatable rounds)
 
@@ -83,9 +82,19 @@ Safety rollback behavior:
 - if destination creation fails mid-batch and rollback is enabled, already-created destination endpoints in that batch are deleted before re-raising
 - if source deletion appears incomplete, idempotent forced cleanup is attempted
 
-### Phase 4: Post-migration connectivity check (optional)
+### Post-mobility spot-check (always runs)
 
-- same controller-to-VM sweep behavior as phase 2
+After migration rounds complete (and before the 3-second pause), the test runs six informational pings:
+
+1. controller endpoint -> 3 deterministic-random VM IPs (`POST_MOBILITY_SPOTCHECK_SEED`)
+2. one VM currently on VTEP2 -> controller endpoint
+3. the same VTEP2 VM -> 2 VM IPs on a selected VTEP3+
+
+Each attempt prints `SUCCESS` or `FAILED`. These checks do not assert/fail the test.
+
+### Phase 4: Post-migration continuation
+
+- logs completion and continues teardown
 
 ## Packet Captures and Teardown Summary
 
@@ -119,26 +128,26 @@ Then the test sleeps 5 seconds before continuing cleanup output.
 
 - `NUM_VTEPS = 7`
 - `NUM_HOSTS = 7`
-- `NUM_MOBILE_VMS = 64`
+- `NUM_MOBILE_VMS = 20`
 - `CONTROLLER_VTEPS = {"vtep1"}`
-- `ENABLE_CONTROLLER_PING_CHECKS = False`
+- `POST_MOBILITY_SPOTCHECK_SEED = 42`
 
 ### Environment variables consumed by the test
 
 - `MOBILITY_OVERLAP_SECONDS`
   - default: `0.2`
 - `MIGRATION_BATCH_SIZE`
-  - default: `1`
+  - default: `5`
 - `MIGRATION_BATCH_SETTLE_SECONDS`
-  - default: `0.2`
+  - default: `0.5`
 - `MIGRATION_REPEAT_COUNT`
-  - default: `1`
+  - default: `3`
 - `ENABLE_MIGRATION_BATCH_SAFETY_ROLLBACK`
   - default: `true`
 - `MUNET_CLI`
   - set to `1` to drop into `munet>` CLI at test end
 
-Note: `ENABLE_CONTROLLER_PING_CHECKS` is currently a code constant, not an environment variable.
+Note: invalid numeric env-var values fall back to in-code fallback values.
 
 ## Run Example
 

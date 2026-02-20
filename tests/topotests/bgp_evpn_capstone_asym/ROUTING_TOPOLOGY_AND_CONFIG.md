@@ -175,11 +175,18 @@ Each host uses `vtepbond`; mobile endpoints are MACVLAN interfaces created/delet
 From `test_evpn_capstone_asym.py`:
 
 - `CONTROLLER_VTEPS = {"vtep1"}` (hub/controller side is fixed)
-- `NUM_MOBILE_VMS = 64`
-- default `ENABLE_ASYMMETRIC_POLICY_CHECKS = True`
-- default `ENFORCE_SPOKE_TO_SPOKE_ISOLATION = False`
+- `NUM_MOBILE_VMS = 30`
+- migration behavior is controlled by:
+  - `MIGRATION_BATCH_SIZE` (default `5`)
+  - `MIGRATION_REPEAT_COUNT` (default `3`)
+  - `MIGRATION_BATCH_SETTLE_SECONDS` (default `0.5`)
+  - `MOBILITY_OVERLAP_SECONDS` (default `0.2`)
+- an always-on post-mobility informational spot-check runs after migration:
+  - controller -> 3 deterministic-random VM IPs
+  - one VM on VTEP2 -> controller endpoint
+  - same VTEP2 VM -> 2 VM IPs on one VTEP3+
 
-So by default, the test actively checks controller↔VM reachability, but does not fail if sampled spoke↔spoke ping succeeds unless isolation enforcement is enabled.
+These spot-check pings print `SUCCESS` / `FAILED` and do not assert/fail the test.
 
 ## 10) Fast troubleshooting checklist
 
