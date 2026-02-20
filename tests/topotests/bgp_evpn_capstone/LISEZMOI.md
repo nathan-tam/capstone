@@ -41,7 +41,8 @@ Topology:
 
 Addressing:
 
-- VTEP VXLAN source IP for `vtep{i}`: `{10*i}.{10*i}.{10*i}.{10*i}`
+- VTEP VXLAN source IP for `vtep{i}`: `192.168.100.{14+i}`
+  - `vtep1..vtep7` => `192.168.100.15..192.168.100.21`
 - SVI IPs:
   - `vtep1..vtep5`: `192.168.0.251..192.168.0.255`
   - `vtep6+`: `192.168.200.{vtep_index-5}`
@@ -62,7 +63,11 @@ Addressing:
 - if `ENABLE_CONTROLLER_PING_CHECKS` is `True`, controller endpoint pings every VM IP
 - if disabled (default), phase logs that checks are skipped
 
-### Phase 3: Batched live migration
+### Phase 3: Batched live migration (repeatable rounds)
+
+The migration sequence can be repeated multiple full rounds with `MIGRATION_REPEAT_COUNT`.
+
+If `MIGRATION_REPEAT_COUNT=3`, the test migrates the full VM set three times (round 1, round 2, round 3), updating VM location state between rounds.
 
 For each batch:
 
@@ -126,6 +131,8 @@ Then the test sleeps 5 seconds before continuing cleanup output.
   - default: `1`
 - `MIGRATION_BATCH_SETTLE_SECONDS`
   - default: `0.2`
+- `MIGRATION_REPEAT_COUNT`
+  - default: `1`
 - `ENABLE_MIGRATION_BATCH_SAFETY_ROLLBACK`
   - default: `true`
 - `MUNET_CLI`
@@ -152,3 +159,77 @@ python3 -m pytest -s test_evpn_capstone.py::test_mobility
 3. `bridge fdb show`
 4. validate VNI/VXLAN state and BGP sessions
 5. inspect capture files with Wireshark/tshark
+
+## CLI Cookbook: Example Test Invocations
+
+Run these from the FRR repo root.
+
+- Baseline normal mobility test:
+
+```bash
+PYTEST_XDIST_MODE=no \
+python3 -m pytest -s tests/topotests/bgp_evpn_capstone/test_evpn_capstone.py::test_mobility
+```
+
+- Repeat the full migration sequence 3 times:
+
+```bash
+PYTEST_XDIST_MODE=no MIGRATION_REPEAT_COUNT=3 \
+python3 -m pytest -s tests/topotests/bgp_evpn_capstone/test_evpn_capstone.py::test_mobility
+```
+
+- Migrate endpoints in batches of 8:
+
+```bash
+PYTEST_XDIST_MODE=no MIGRATION_BATCH_SIZE=8 \
+python3 -m pytest -s tests/topotests/bgp_evpn_capstone/test_evpn_capstone.py::test_mobility
+```
+
+- Increase duplicate-MAC overlap window to 1.0s:
+
+```bash
+PYTEST_XDIST_MODE=no MOBILITY_OVERLAP_SECONDS=1.0 \
+python3 -m pytest -s tests/topotests/bgp_evpn_capstone/test_evpn_capstone.py::test_mobility
+```
+
+- Remove inter-batch settle delay:
+
+```bash
+PYTEST_XDIST_MODE=no MIGRATION_BATCH_SETTLE_SECONDS=0 \
+python3 -m pytest -s tests/topotests/bgp_evpn_capstone/test_evpn_capstone.py::test_mobility
+```
+
+- Disable batch safety rollback (debug behavior differences):
+
+```bash
+PYTEST_XDIST_MODE=no ENABLE_MIGRATION_BATCH_SAFETY_ROLLBACK=false \
+python3 -m pytest -s tests/topotests/bgp_evpn_capstone/test_evpn_capstone.py::test_mobility
+```
+
+- Stress-style run: 5 rounds, batch size 16, short settle timer:
+
+```bash
+PYTEST_XDIST_MODE=no MIGRATION_REPEAT_COUNT=5 MIGRATION_BATCH_SIZE=16 MIGRATION_BATCH_SETTLE_SECONDS=0.05 \
+python3 -m pytest -s tests/topotests/bgp_evpn_capstone/test_evpn_capstone.py::test_mobility
+```
+
+- Baseline asym mobility test:
+
+```bash
+PYTEST_XDIST_MODE=no \
+python3 -m pytest -s tests/topotests/bgp_evpn_capstone_asym/test_evpn_capstone_asym.py::test_mobility
+```
+
+- Asym test with repeated migrations (3 rounds):
+
+```bash
+PYTEST_XDIST_MODE=no MIGRATION_REPEAT_COUNT=3 \
+python3 -m pytest -s tests/topotests/bgp_evpn_capstone_asym/test_evpn_capstone_asym.py::test_mobility
+```
+
+- Enter `munet>` CLI after test teardown for live inspection:
+
+```bash
+PYTEST_XDIST_MODE=no MUNET_CLI=1 MIGRATION_REPEAT_COUNT=2 \
+python3 -m pytest -s tests/topotests/bgp_evpn_capstone/test_evpn_capstone.py::test_mobility
+```
