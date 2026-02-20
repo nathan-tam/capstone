@@ -41,7 +41,7 @@ pytestmark = [
 # Test scaling parameters
 NUM_VTEPS = 7
 NUM_HOSTS = 7  # One host per VTEP for VM mobility testing
-NUM_MOBILE_VMS = 64  # Number of VMs that will move around
+NUM_MOBILE_VMS = 80 # Number of VMs that will move around
 
 # Controller VTEPs participate in topology/BGP but are excluded from endpoint mobility.
 CONTROLLER_VTEPS = {"vtep1"}
@@ -65,18 +65,25 @@ except ValueError:
 
 # Number of endpoints to move together during phase 3 migration.
 try:
-    MIGRATION_BATCH_SIZE = max(1, int(os.getenv("MIGRATION_BATCH_SIZE", "1")))
+    MIGRATION_BATCH_SIZE = max(1, int(os.getenv("MIGRATION_BATCH_SIZE", "5")))
 except ValueError:
-    MIGRATION_BATCH_SIZE = 1
+    MIGRATION_BATCH_SIZE = 5
+
+# Number of full migration rounds to run in phase 3.
+# Example: 3 means move the full VM set three times, one full pass per round.
+try:
+    MIGRATION_REPEAT_COUNT = max(1, int(os.getenv("MIGRATION_REPEAT_COUNT", "3")))
+except ValueError:
+    MIGRATION_REPEAT_COUNT = 3
 
 # Optional settle delay between migration batches.
 try:
     MIGRATION_BATCH_SETTLE_SECONDS = max(
         0.0,
-        float(os.getenv("MIGRATION_BATCH_SETTLE_SECONDS", "0.2")),
+        float(os.getenv("MIGRATION_BATCH_SETTLE_SECONDS", "0.5")),
     )
 except ValueError:
-    MIGRATION_BATCH_SETTLE_SECONDS = 0.2
+    MIGRATION_BATCH_SETTLE_SECONDS = 0.6
 
 # Safety mode: if batch destination creation partially fails, roll back already-created
 # destination endpoints in that batch before re-raising the error.
@@ -588,7 +595,7 @@ def test_mobility(tgen):
     Steps:
     1. Deploy mobile VMs distributed across hosts (one per VTEP)
     2. Verify controller endpoint can reach all VM IPs at initial locations
-    3. Live-migrate each VM to a different VTEP (brief duplicate-MAC window)
+    3. Live-migrate the full VM set one or more rounds (brief duplicate-MAC window)
     4. Verify controller endpoint can still reach all VM IPs after migration
     5. Capture BGP packet data during migrations
     """
@@ -613,6 +620,7 @@ def test_mobility(tgen):
     print("\nStarting packet capture on spine1, vtep2, and controller VTEP...")
     print(f"Using mobility overlap timer: {MOBILITY_OVERLAP_SECONDS:.3f}s")
     print(f"Migration batch size: {MIGRATION_BATCH_SIZE}")
+    print(f"Migration repeat count: {MIGRATION_REPEAT_COUNT}")
     print(f"Batch settle timer: {MIGRATION_BATCH_SETTLE_SECONDS:.3f}s")
     print(f"Batch safety rollback: {ENABLE_MIGRATION_BATCH_SAFETY_ROLLBACK}")
     
@@ -722,37 +730,46 @@ def test_mobility(tgen):
             print("Controller ping checks are disabled (initial deployment phase).")
 
         # --- Phase 3: migrate VMs to different VTEPs --- #
-        print(f"\nPhase 3: Moving {NUM_MOBILE_VMS} VMs to different locations...")
+        print(
+            f"\nPhase 3: Moving {NUM_MOBILE_VMS} VMs to different locations "
+            f"for {MIGRATION_REPEAT_COUNT} round(s)..."
+        )
         print("(Creating at destination while source exists, then cleaning up source)")
-        
-        for batch_start in range(1, NUM_MOBILE_VMS + 1, MIGRATION_BATCH_SIZE):
-            batch_end = min(batch_start + MIGRATION_BATCH_SIZE - 1, NUM_MOBILE_VMS)
-            migration_batch = []
 
-            for vm_idx in range(batch_start, batch_end + 1):
-                migration_batch.append(
-                    build_vm_migration_plan(
-                        vm_idx,
-                        vm_locations,
-                        mobility_vtep_indices,
-                        mobility_host_indices,
+        for migration_round in range(1, MIGRATION_REPEAT_COUNT + 1):
+            print(f"  Starting migration round {migration_round}/{MIGRATION_REPEAT_COUNT}")
+
+            for batch_start in range(1, NUM_MOBILE_VMS + 1, MIGRATION_BATCH_SIZE):
+                batch_end = min(batch_start + MIGRATION_BATCH_SIZE - 1, NUM_MOBILE_VMS)
+                migration_batch = []
+
+                for vm_idx in range(batch_start, batch_end + 1):
+                    migration_batch.append(
+                        build_vm_migration_plan(
+                            vm_idx,
+                            vm_locations,
+                            mobility_vtep_indices,
+                            mobility_host_indices,
+                        )
                     )
-                )
 
-            migrate_macvlan_endpoints_live_batch(tgen, migration_batch)
+                migrate_macvlan_endpoints_live_batch(tgen, migration_batch)
 
-            for migration in migration_batch:
-                vm_locations[migration["vm_name"]] = (
-                    migration["new_host_idx"],
-                    migration["new_vtep_idx"],
-                )
+                for migration in migration_batch:
+                    vm_locations[migration["vm_name"]] = (
+                        migration["new_host_idx"],
+                        migration["new_vtep_idx"],
+                    )
 
-            moved_count = batch_end
-            if moved_count % 20 == 0 or moved_count == NUM_MOBILE_VMS:
-                print(f"  Migration progress: {moved_count}/{NUM_MOBILE_VMS}")
+                moved_count = batch_end
+                if moved_count % 20 == 0 or moved_count == NUM_MOBILE_VMS:
+                    print(
+                        f"  Round {migration_round}/{MIGRATION_REPEAT_COUNT} progress: "
+                        f"{moved_count}/{NUM_MOBILE_VMS}"
+                    )
 
-            if MIGRATION_BATCH_SETTLE_SECONDS > 0.0:
-                sleep(MIGRATION_BATCH_SETTLE_SECONDS)
+                if MIGRATION_BATCH_SETTLE_SECONDS > 0.0:
+                    sleep(MIGRATION_BATCH_SETTLE_SECONDS)
 
         # Wait for all BGP/EVPN updates to process.
         sleep(5)
@@ -766,11 +783,11 @@ def test_mobility(tgen):
     finally:
         # Stop capture and flush output.
         spine.run("if [ -f /tmp/tcpdump_evpn.pid ]; then kill $(cat /tmp/tcpdump_evpn.pid); fi")
-        vtep2.run(
-            "if [ -f /tmp/tcpdump_evpn_vtep2.pid ]; then kill $(cat /tmp/tcpdump_evpn_vtep2.pid); fi"
-        )
         controller_vtep.run(
             "if [ -f /tmp/tcpdump_evpn_controller.pid ]; then kill $(cat /tmp/tcpdump_evpn_controller.pid); fi"
+        )
+        vtep2.run(
+            "if [ -f /tmp/tcpdump_evpn_vtep2.pid ]; then kill $(cat /tmp/tcpdump_evpn_vtep2.pid); fi"
         )
         spine.run("sleep 1")
 
@@ -792,11 +809,12 @@ def test_mobility(tgen):
             f"  spine1: {pcap_file} (packets={spine_pcap_packets})"
         )
         print(
-            f"  vtep2: {vtep2_pcap_file} (packets={vtep2_pcap_packets})"
-        )
-        print(
             f"  {controller_vtep_name}: {controller_pcap_file} (packets={controller_pcap_packets})"
         )
+        print(
+            f"  vtep2: {vtep2_pcap_file} (packets={vtep2_pcap_packets})"
+        )
+
 
         # Brief pause to keep capture summary visible before subsequent output.
         sleep(5)
