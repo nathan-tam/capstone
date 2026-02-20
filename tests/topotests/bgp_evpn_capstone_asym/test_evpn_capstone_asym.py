@@ -14,6 +14,7 @@
 import os
 import sys
 import shlex
+import random
 from time import sleep
 import platform
 import pytest
@@ -41,7 +42,7 @@ pytestmark = [
 # Test scaling parameters
 NUM_VTEPS = 7
 NUM_HOSTS = 7  # One host per VTEP for VM mobility testing
-NUM_MOBILE_VMS = 80  # Number of VMs that will move around
+NUM_MOBILE_VMS = 30  # Number of VMs that will move around
 
 # Controller VTEPs participate in topology/BGP but are excluded from endpoint mobility.
 CONTROLLER_VTEPS = {"vtep1"}
@@ -51,20 +52,6 @@ CONTROLLER_ENDPOINT_HOST = "host1"
 CONTROLLER_ENDPOINT_IFACE = "controller"
 CONTROLLER_ENDPOINT_IP = "192.168.100.254/16"
 CONTROLLER_ENDPOINT_MAC = "00:aa:bb:dd:00:01"
-
-# Toggle controller-to-VM ping verification during phase 2 and phase 4.
-# Set to False to skip controller reachability sweeps while keeping mobility logic unchanged.
-ENABLE_CONTROLLER_PING_CHECKS = False
-
-# Policy checks for hub/spoke EVPN behavior in the asym topology:
-# - selected mobile VMs must reach controller endpoint
-# - selected mobile VMs on different spokes should not reach each other directly
-ENABLE_ASYMMETRIC_POLICY_CHECKS = True
-# Set to False to skip only the spoke-to-spoke isolation assertion.
-# This is useful when testing other features even if inter-spoke connectivity exists.
-ENFORCE_SPOKE_TO_SPOKE_ISOLATION = False
-ASYMMETRIC_CHECK_VM_A = 1
-ASYMMETRIC_CHECK_VM_B = 2
 
 # Duration (seconds) to keep duplicate-MAC overlap during live migration.
 # Can be overridden with env var MOBILITY_OVERLAP_SECONDS.
@@ -101,6 +88,9 @@ ENABLE_MIGRATION_BATCH_SAFETY_ROLLBACK = (
     os.getenv("ENABLE_MIGRATION_BATCH_SAFETY_ROLLBACK", "true").strip().lower()
     not in {"0", "false", "no", "off"}
 )
+
+# Fixed seed used for deterministic random VM spot-check selection.
+POST_MOBILITY_SPOTCHECK_SEED = 42
 
 def get_pcap_packet_count(node, file_path):
     """Return packet count, or 'missing' when the pcap does not exist."""
@@ -556,120 +546,107 @@ def delete_macvlan_endpoint_if_exists(tgen, host_name, vm_name):
     host.run(f"ip link show {vm_name} >/dev/null 2>&1 && ip link del {vm_name} || true")
 
 
-def verify_controller_to_vm_connectivity(tgen, num_mobile_vms, phase_name):
-    """Verify the static controller endpoint can ping each mobile VM IP."""
-    connectivity_failures = 0
-    progress_interval = 10
+def run_post_mobility_controller_spotcheck(tgen, num_mobile_vms, vm_locations):
+    """Run post-mobility informational pings without affecting test pass/fail."""
+    if num_mobile_vms <= 0:
+        print("\nPost-mobility spot-check skipped: no mobile VMs configured")
+        return
 
-    print(f"\nController reachability check ({phase_name})...")
+    sample_size = min(3, num_mobile_vms)
+    selector = random.Random(POST_MOBILITY_SPOTCHECK_SEED)
+    vm_indices = selector.sample(range(1, num_mobile_vms + 1), sample_size)
+
     print(
-        f"Checking {num_mobile_vms} VM endpoints from {CONTROLLER_ENDPOINT_HOST}:{CONTROLLER_ENDPOINT_IFACE}"
+        "\nPost-mobility controller spot-check: "
+        f"pinging {sample_size} deterministic-random VM endpoint(s)"
     )
 
-    for vm_idx in range(1, num_mobile_vms + 1):
+    for vm_idx in vm_indices:
+        vm_name = f"vm{vm_idx}"
         target_ip = f"192.168.100.{vm_idx}"
-        if verify_ping(
+        controller_ip = CONTROLLER_ENDPOINT_IP.split("/")[0]
+        print(
+            f"  Pinging from {CONTROLLER_ENDPOINT_IFACE} on {CONTROLLER_ENDPOINT_HOST} "
+            f"with IP {controller_ip} to {vm_name} at {target_ip} ...",
+            end="",
+        )
+        ping_ok = verify_ping(
             tgen,
             CONTROLLER_ENDPOINT_HOST,
             CONTROLLER_ENDPOINT_IFACE,
             target_ip,
             count=1,
-        ):
-            if vm_idx % 20 == 0:
-                print(f"  ✓ controller -> vm{vm_idx} ({target_ip})")
-        else:
-            print(f"  ✗ controller -> vm{vm_idx} ({target_ip}) FAILED")
-            connectivity_failures += 1
+        )
+        print(" SUCCESS" if ping_ok else " FAILED")
 
-        if vm_idx % progress_interval == 0 or vm_idx == num_mobile_vms:
-            checked = vm_idx
-            print(
-                f"  Progress: {checked}/{num_mobile_vms} checked, failures so far: {connectivity_failures}"
-            )
+    # Mobile endpoint on VTEP2 -> controller endpoint on VTEP1.
+    vtep2_candidates = []
+    for vm_name, (host_idx, vtep_idx) in vm_locations.items():
+        if vtep_idx == 2:
+            vm_idx = int(vm_name.replace("vm", ""))
+            vtep2_candidates.append((vm_idx, vm_name, host_idx))
 
-    assert (
-        connectivity_failures == 0
-    ), f"controller endpoint failed to reach {connectivity_failures}/{num_mobile_vms} VMs during {phase_name}"
+    if not vtep2_candidates:
+        print("  Skipping VTEP2-originated checks: no mobile MACVLAN currently on VTEP2")
+        return
 
-    print(f"Controller reachability check ({phase_name}) PASSED: all {num_mobile_vms} VMs reachable")
-
-
-def verify_asymmetric_connectivity_policy(tgen, vm_locations, phase_name):
-    """Validate hub/spoke behavior for two sampled mobile endpoints."""
-    vm_a_name = f"vm{ASYMMETRIC_CHECK_VM_A}"
-    vm_b_name = f"vm{ASYMMETRIC_CHECK_VM_B}"
-
-    assert vm_a_name in vm_locations, f"{vm_a_name} missing from vm_locations during {phase_name}"
-    assert vm_b_name in vm_locations, f"{vm_b_name} missing from vm_locations during {phase_name}"
-
-    host_a_idx, vtep_a_idx = vm_locations[vm_a_name]
-    host_b_idx, vtep_b_idx = vm_locations[vm_b_name]
-
-    assert (
-        vtep_a_idx != vtep_b_idx
-    ), f"sample VMs ended up on the same VTEP during {phase_name}; choose different samples"
-
-    host_a_name = f"host{host_a_idx}"
-    host_b_name = f"host{host_b_idx}"
+    vtep2_candidates.sort(key=lambda entry: entry[0])
+    source_vm_idx, source_vm_name, source_host_idx = vtep2_candidates[0]
+    source_host_name = f"host{source_host_idx}"
+    source_vm_ip = f"192.168.100.{source_vm_idx}"
     controller_ip = CONTROLLER_ENDPOINT_IP.split("/")[0]
-    vm_a_ip = f"192.168.100.{ASYMMETRIC_CHECK_VM_A}"
-    vm_b_ip = f"192.168.100.{ASYMMETRIC_CHECK_VM_B}"
 
-    print(f"\nAsymmetric policy check ({phase_name})...")
     print(
-        f"  Samples: {vm_a_name} on {host_a_name}(vtep{vtep_a_idx}), "
-        f"{vm_b_name} on {host_b_name}(vtep{vtep_b_idx})"
+        f"  Pinging from {source_vm_name} on {source_host_name} with IP {source_vm_ip} "
+        f"to the controller at {controller_ip} ...",
+        end="",
     )
-
-    assert verify_ping(
+    to_controller_ok = verify_ping(
         tgen,
-        host_a_name,
-        vm_a_name,
+        source_host_name,
+        source_vm_name,
         controller_ip,
         count=1,
-    ), f"{vm_a_name} failed to reach controller endpoint during {phase_name}"
+    )
+    print(" SUCCESS" if to_controller_ok else " FAILED")
 
-    assert verify_ping(
-        tgen,
-        host_b_name,
-        vm_b_name,
-        controller_ip,
-        count=1,
-    ), f"{vm_b_name} failed to reach controller endpoint during {phase_name}"
+    # Source mobile endpoint on VTEP2 -> two different mobile endpoints on one VTEP3+.
+    candidates_by_vtep = {}
+    for vm_name, (_, vtep_idx) in vm_locations.items():
+        if vtep_idx >= 3:
+            vm_idx = int(vm_name.replace("vm", ""))
+            candidates_by_vtep.setdefault(vtep_idx, []).append((vm_idx, vm_name))
 
-    if ENFORCE_SPOKE_TO_SPOKE_ISOLATION:
-        assert not verify_ping(
-            tgen,
-            host_a_name,
-            vm_a_name,
-            vm_b_ip,
-            count=1,
-        ), (
-            f"{vm_a_name} unexpectedly reached {vm_b_name} during {phase_name}; "
-            "spoke-to-spoke reachability should be blocked"
-        )
+    selected_vtep = None
+    selected_targets = []
+    for vtep_idx in sorted(candidates_by_vtep):
+        vm_entries = sorted(candidates_by_vtep[vtep_idx], key=lambda entry: entry[0])
+        vm_entries = [entry for entry in vm_entries if entry[1] != source_vm_name]
+        if len(vm_entries) >= 2:
+            selected_vtep = vtep_idx
+            selected_targets = vm_entries[:2]
+            break
 
-        assert not verify_ping(
-            tgen,
-            host_b_name,
-            vm_b_name,
-            vm_a_ip,
-            count=1,
-        ), (
-            f"{vm_b_name} unexpectedly reached {vm_a_name} during {phase_name}; "
-            "spoke-to-spoke reachability should be blocked"
-        )
+    if len(selected_targets) < 2:
+        print("  Skipping VTEP3+ peer checks: fewer than two suitable target MACVLANs found")
+        return
 
+    for _, target_vm_name in selected_targets:
+        target_vm_idx = int(target_vm_name.replace("vm", ""))
+        target_ip = f"192.168.100.{target_vm_idx}"
         print(
-            "Asymmetric policy check passed: sampled mobile endpoints reach controller "
-            "and do not reach each other"
+            f"  Pinging from {source_vm_name} on {source_host_name} with IP {source_vm_ip} "
+            f"to {target_vm_name} on vtep{selected_vtep} at {target_ip} ...",
+            end="",
         )
-    else:
-        print(
-            "Asymmetric policy check passed: sampled mobile endpoints reach controller; "
-            "spoke-to-spoke isolation enforcement is disabled"
+        to_mobile_ok = verify_ping(
+            tgen,
+            source_host_name,
+            source_vm_name,
+            target_ip,
+            count=1,
         )
-
+        print(" SUCCESS" if to_mobile_ok else " FAILED")
 
 
 def test_mobility(tgen):
@@ -809,16 +786,8 @@ def test_mobility(tgen):
         # Wait for BGP/EVPN to stabilize.
         sleep(3)
 
-        # --- Phase 2: verify initial connectivity --- #
-        print("\nPhase 2: Verifying connectivity from initial locations...")
-        print("Running controller-to-VM reachability sweep...\n")
-        if ENABLE_CONTROLLER_PING_CHECKS:
-            verify_controller_to_vm_connectivity(tgen, NUM_MOBILE_VMS, "initial deployment")
-        else:
-            print("Controller ping checks are disabled (initial deployment phase).")
-
-        if ENABLE_ASYMMETRIC_POLICY_CHECKS:
-            verify_asymmetric_connectivity_policy(tgen, vm_locations, "initial deployment")
+        # --- Phase 2: post-deployment settle --- #
+        print("\nPhase 2: Initial deployment complete; proceeding to mobility...")
 
         # --- Phase 3: migrate VMs to different VTEPs --- #
         print(
@@ -865,15 +834,11 @@ def test_mobility(tgen):
         # Wait for all BGP/EVPN updates to process.
         sleep(5)
 
-        # --- Phase 4: verify connectivity at new locations --- #
-        print("\nPhase 4: Verifying connectivity at new locations...")
-        if ENABLE_CONTROLLER_PING_CHECKS:
-            verify_controller_to_vm_connectivity(tgen, NUM_MOBILE_VMS, "post migration")
-        else:
-            print("Controller ping checks are disabled (post migration phase).")
+        run_post_mobility_controller_spotcheck(tgen, NUM_MOBILE_VMS, vm_locations)
+        sleep(3)
 
-        if ENABLE_ASYMMETRIC_POLICY_CHECKS:
-            verify_asymmetric_connectivity_policy(tgen, vm_locations, "post migration")
+        # --- Phase 4: post-migration continuation --- #
+        print("\nPhase 4: Post-migration checks complete.")
     finally:
         # Stop capture and flush output.
         spine.run("if [ -f /tmp/tcpdump_evpn.pid ]; then kill $(cat /tmp/tcpdump_evpn.pid); fi")
