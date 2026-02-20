@@ -1,5 +1,5 @@
 # Simulating Host Mobility in Topotest with FRRouting
-This documentation details the methodology used to simulate Host Mobility in an EVPN/VXLAN fabric using FRRouting Topotests. It also serves as some basic guidance for running experiments and analysing results.
+This documentation details the methodology used to simulate Host Mobility in an EVPN/VXLAN fabric using FRRouting Topotests. It also serves as some basic guidance for running experiments and analysing results. There is a document in the tests/topotests/test_evpn_capstone directory called LISEZ.moi that has more detailed information. The Asymmetrical routing experiment details are located in tests/topotests/test_evpn_capstone_asym in a document called ROUTING_TOPOLOGY_AND_CONFIG.md.
 ### Overview
 "Host Mobility" usually refers to a host migrating from one Access Point to another while retaining its MAC and IP address. The network fabric (EVPN) must detect this move and update its routing tables to send traffic to the new location.<br>
 Simulating this in a containerized network test environment (Mininet/Topotest) is challenging because we don't have real hosts to move around. We attempt to simulate this behavior using Linux MACVLAN interfaces.
