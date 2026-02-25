@@ -23,14 +23,10 @@ This section assumes you have already completed the FRR Workspace Setup Guide fr
 2. Use `sudo` to run the test without pauses.
 3. Use `sudo` to run the test with a pause, dropping you into the `spine1` node before the test runs. Note that the test will continue to run as you're 'consoled' into the node.
 ### Packet Capturing
-When the test runs it automatically captures BGP packets from a few nodes. The captures file are saved to
-If you'd like to get the `.pcap` file off the container and onto your host machine to analyze with Wireshark you can use the following command:
+When the test runs it automatically captures BGP packets from a few nodes. If you'd like to get the `.pcap` file off the container and onto your host machine to analyze with Wireshark the files are saved to:
+`/tmp/topotests/bgp_evpn_capstone.test_evpn_capstone/<node>/<node>_evpn_mobility.pcap`
 <br>
-First, on the container, run the following command to get the path to the `.pcap`:
-```command
-find /tmp -name "evpn_mobility.pcap" -type f 2>/dev/null
-```
-Then, once you have the path, run this command on the host:
+Once you have the path to your desired file you can run this command on your host to copy it down:
 ```command
 docker cp <container_id>:/path/to/evpn_mobility.pcap ./evpn_mobility.pcap
 ```
@@ -39,4 +35,4 @@ Note that every time you run the test it will overwrite the `.pcap` file.
 #### Wireshark
 To filter for BGP Update packets (remember, Withdraw messages are part of Update messages) we can use the following Wireshark filters to find what we're looking for:
 * `bgp.type == 2` will show all BGP Update messages captured.
-* `bgp.update.path_attribute.type_code == 15` will show all BGP messages that contain `MP_UNREACH_NLRI`.
+* `bgp.update.path_attribute.type_code == 15` will show all BGP messages that contain `MP_UNREACH_NLRI`, useful for double checking numbers. Type code 14 will show messages with `MP_REACH_NLRI`.

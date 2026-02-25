@@ -101,20 +101,8 @@ def get_pcap_packet_count(node, file_path):
         )
     ).strip()
 
-
+# Uses tshark to parse tcpdump pcap and filter by BGP path attribute type codes to count REACH and UNREACH packets
 def get_pcap_mp_nlri_counts(node, file_path):
-    """Count BGP UPDATE packets containing MP_REACH_NLRI and/or MP_UNREACH_NLRI.
-
-    Uses tshark to parse the pcap and filter by BGP path attribute type codes:
-      - Type 14: MP_REACH_NLRI
-      - Type 15: MP_UNREACH_NLRI
-
-    Returns a dict with keys 'mp_reach', 'mp_unreach', and 'either', or the
-    string 'missing' when the pcap file does not exist.
-
-    Note: A single BGP UPDATE can carry both attributes, so
-    'either' <= 'mp_reach' + 'mp_unreach'.
-    """
     path = shlex.quote(file_path)
 
     exists = node.run("[ -f {} ] && echo yes || echo no".format(path)).strip()
@@ -126,18 +114,21 @@ def get_pcap_mp_nlri_counts(node, file_path):
     if has_tshark != "yes":
         return "tshark-not-found"
 
+    # Type 14: MP_REACH_NLRI
     mp_reach = node.run(
         "tshark -r {0} -Y 'bgp.update.path_attribute.type_code == 14' 2>/dev/null | wc -l".format(
             path
         )
     ).strip()
 
+    # Type 15: MP_UNREACH_NLRI
     mp_unreach = node.run(
         "tshark -r {0} -Y 'bgp.update.path_attribute.type_code == 15' 2>/dev/null | wc -l".format(
             path
         )
     ).strip()
 
+    # A single BGP UPDATE can carry both attributes, so we get count of packets with either attribute
     either = node.run(
         "tshark -r {0} -Y 'bgp.update.path_attribute.type_code == 14 || "
         "bgp.update.path_attribute.type_code == 15' 2>/dev/null | wc -l".format(path)
@@ -150,6 +141,7 @@ def get_pcap_mp_nlri_counts(node, file_path):
             "either": int(either),
         }
     except ValueError:
+        # Returns a dict with keys 'mp_reach', 'mp_unreach', and 'either'. Returns missing if pcap file does not exist
         return {"mp_reach": mp_reach, "mp_unreach": mp_unreach, "either": either}
 
 def macvlan_endpoint_exists(tgen, host_name, vm_name):
