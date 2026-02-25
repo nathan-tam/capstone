@@ -17,13 +17,14 @@ The script performs the following logic to simulate a migration:
 9. As soon as the migrated interfaces sends a message, `vtep2` will send a BGP RA to the spine.
 10. The spine will then advertise that information to the rest of the network.
 11. Other VTEPs receive the update and switch their routing path from `vtep1` to `vtep2`.
+### Quick Start
+This section assumes you have already completed the FRR Workspace Setup Guide from the Notion wiki and already have the FRR container running.
+1. Change into the test directory: 
+2. Use `sudo` to run the test without pauses.
+3. Use `sudo` to run the test with a pause, dropping you into the `spine1` node before the test runs. Note that the test will continue to run as you're 'consoled' into the node.
 ### Packet Capturing
-When the test runs it automatically captures BGP packets from, at the time of writing, the `spine1` node. You'll see something like the output below. Currently, the test does not capture any ICMP packets. That functionality should be added to actually verify connectivity outside of what the script tells us. If you're reading this message, it hasn't been fixed.
-```output
-148 packets captured
-156 packets received by filter
-```
-In order for this to be of any use, we need to get the `.pcap` file off the container and onto our host machine so we can open it with Wireshark. This is very simple.
+When the test runs it automatically captures BGP packets from a few nodes. The captures file are saved to
+If you'd like to get the `.pcap` file off the container and onto your host machine to analyze with Wireshark you can use the following command:
 <br>
 First, on the container, run the following command to get the path to the `.pcap`:
 ```command
@@ -38,3 +39,4 @@ Note that every time you run the test it will overwrite the `.pcap` file.
 #### Wireshark
 To filter for BGP Update packets (remember, Withdraw messages are part of Update messages) we can use the following Wireshark filters to find what we're looking for:
 * `bgp.type == 2` will show all BGP Update messages captured.
+* `bgp.update.path_attribute.type_code == 15` will show all BGP messages that contain `MP_UNREACH_NLRI`.
