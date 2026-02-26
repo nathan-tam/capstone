@@ -20,8 +20,8 @@ The script performs the following logic to simulate a migration:
 ### Quick Start
 This section assumes you have already completed the FRR Workspace Setup Guide from the Notion wiki and already have the FRR container running.
 1. Change into the test directory: 
-2. Use `sudo` to run the test without pauses.
-3. Use `sudo` to run the test with a pause, dropping you into the `spine1` node before the test runs. Note that the test will continue to run as you're 'consoled' into the node.
+2. Use `sudo -E pytest -s bgp_evpn_capstone` to run the test without pauses.
+3. Use `sudo -E pytest -s --pause --vtysh=spine1 bgp_evpn_capstone` to run the test with a pause, dropping you into the `spine1` node before the test runs. Note that the test will continue to run as you're 'consoled' into the node.
 ### Packet Capturing
 When the test runs it automatically captures BGP packets from a few nodes. If you'd like to get the `.pcap` file off the container and onto your host machine to analyze with Wireshark the files are saved to:
 `/tmp/topotests/bgp_evpn_capstone.test_evpn_capstone/<node>/<node>_evpn_mobility.pcap`
@@ -30,7 +30,8 @@ Once you have the path to your desired file you can run this command on your hos
 ```command
 docker cp <container_id>:/path/to/evpn_mobility.pcap ./evpn_mobility.pcap
 ```
-Note that every time you run the test it will overwrite the `.pcap` file.
+The test itself will print out some statisics about the capture at the very end, such as the total number of packets captured and how many of those were `MP_UNREACH_NLRI` and `MP_REACH_NLRI` messages.
+Note that every time you run the test it will overwrite the previous `.pcap` files.
 
 #### Wireshark
 To filter for BGP Update packets (remember, Withdraw messages are part of Update messages) we can use the following Wireshark filters to find what we're looking for:

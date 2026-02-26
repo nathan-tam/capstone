@@ -516,7 +516,18 @@ def tgen(request):
 
     # Provide tgen as argument to each test function
     yield tgen
-    tgen.stop_topology()
+
+    # Suppress the memory allocation report that FRR prints on shutdown.
+    # The topotest framework treats any remaining allocations as "memory leaks".
+    # It dumps a verbose table for every daemon on every router.
+    # We redirect sys.stderr temporarily so the output is discarded during topology teardown.
+    original_stderr = sys.stderr
+    sys.stderr = open(os.devnull, "w")
+    try:
+        tgen.stop_topology()
+    finally:
+        sys.stderr.close()
+        sys.stderr = original_stderr
 
 
 # Skip subsequent tests if an earlier test caused router failures.
