@@ -101,6 +101,49 @@ def get_pcap_packet_count(node, file_path):
         )
     ).strip()
 
+# Uses tshark to parse tcpdump pcap and filter by BGP path attribute type codes to count REACH and UNREACH packets
+def get_pcap_mp_nlri_counts(node, file_path):
+    path = shlex.quote(file_path)
+
+    exists = node.run("[ -f {} ] && echo yes || echo no".format(path)).strip()
+    if exists != "yes":
+        return "missing"
+
+    # Verify tshark is available inside the namespace.
+    has_tshark = node.run("command -v tshark >/dev/null 2>&1 && echo yes || echo no").strip()
+    if has_tshark != "yes":
+        return "tshark-not-found"
+
+    # Type 14: MP_REACH_NLRI
+    mp_reach = node.run(
+        "tshark -r {0} -Y 'bgp.update.path_attribute.type_code == 14' 2>/dev/null | wc -l".format(
+            path
+        )
+    ).strip()
+
+    # Type 15: MP_UNREACH_NLRI
+    mp_unreach = node.run(
+        "tshark -r {0} -Y 'bgp.update.path_attribute.type_code == 15' 2>/dev/null | wc -l".format(
+            path
+        )
+    ).strip()
+
+    # A single BGP UPDATE can carry both attributes, so we get count of packets with either attribute
+    either = node.run(
+        "tshark -r {0} -Y 'bgp.update.path_attribute.type_code == 14 || "
+        "bgp.update.path_attribute.type_code == 15' 2>/dev/null | wc -l".format(path)
+    ).strip()
+
+    try:
+        return {
+            "mp_reach": int(mp_reach),
+            "mp_unreach": int(mp_unreach),
+            "either": int(either),
+        }
+    except ValueError:
+        # Returns a dict with keys 'mp_reach', 'mp_unreach', and 'either'. Returns missing if pcap file does not exist
+        return {"mp_reach": mp_reach, "mp_unreach": mp_unreach, "either": either}
+
 def macvlan_endpoint_exists(tgen, host_name, vm_name):
     """Return True when endpoint interface exists on the host."""
     host = tgen.gears[host_name]
@@ -473,7 +516,18 @@ def tgen(request):
 
     # Provide tgen as argument to each test function
     yield tgen
-    tgen.stop_topology()
+
+    # Suppress the memory allocation report that FRR prints on shutdown.
+    # The topotest framework treats any remaining allocations as "memory leaks".
+    # It dumps a verbose table for every daemon on every router.
+    # We redirect sys.stderr temporarily so the output is discarded during topology teardown.
+    original_stderr = sys.stderr
+    sys.stderr = open(os.devnull, "w")
+    try:
+        tgen.stop_topology()
+    finally:
+        sys.stderr.close()
+        sys.stderr = original_stderr
 
 
 # Skip subsequent tests if an earlier test caused router failures.
@@ -863,16 +917,34 @@ def test_mobility(tgen):
             vtep2_pcap_file,
         )
 
+        # Count only BGP UPDATEs carrying MP_REACH_NLRI / MP_UNREACH_NLRI.
+        spine_nlri = get_pcap_mp_nlri_counts(spine, pcap_file)
+        controller_nlri = get_pcap_mp_nlri_counts(controller_vtep, controller_pcap_file)
+        vtep2_nlri = get_pcap_mp_nlri_counts(vtep2, vtep2_pcap_file)
+
+        def _fmt_nlri(counts):
+            """Format MP NLRI counts for display."""
+            if isinstance(counts, str):
+                return counts  # 'missing' or 'tshark-not-found'
+            return (
+                f"mp_reach={counts['mp_reach']}  "
+                f"mp_unreach={counts['mp_unreach']}  "
+                f"either={counts['either']}"
+            )
+
         print("Packet captures saved:")
         print(
-            f"  spine1: {pcap_file} (packets={spine_pcap_packets})"
+            f"  spine1: {pcap_file} (total_packets={spine_pcap_packets})"
         )
+        print(f"    BGP UPDATE NLRI: {_fmt_nlri(spine_nlri)}")
         print(
-            f"  {controller_vtep_name}: {controller_pcap_file} (packets={controller_pcap_packets})"
+            f"  {controller_vtep_name}: {controller_pcap_file} (total_packets={controller_pcap_packets})"
         )
+        print(f"    BGP UPDATE NLRI: {_fmt_nlri(controller_nlri)}")
         print(
-            f"  vtep2: {vtep2_pcap_file} (packets={vtep2_pcap_packets})"
+            f"  vtep2: {vtep2_pcap_file} (total_packets={vtep2_pcap_packets})"
         )
+        print(f"    BGP UPDATE NLRI: {_fmt_nlri(vtep2_nlri)}")
 
         # Brief pause to keep capture summary visible before subsequent output.
         sleep(5)
