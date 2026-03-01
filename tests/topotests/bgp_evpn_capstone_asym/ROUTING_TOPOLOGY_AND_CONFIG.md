@@ -98,7 +98,7 @@ All VTEPs use:
 - `advertise-all-vni` (required for BGP to discover local VNIs and originate EVPN routes)
 - `advertise-svi-ip`
 - explicit `vni 1000` block with manual RD/RTs
-- `frr defaults datacenter` (enables extended-community propagation and other datacenter BGP defaults)
+- `frr defaults datacenter` (disables `ebgp-requires-policy`, reduces BGP keepalive/hold timers to 3 s/9 s, and enables other datacenter BGP defaults; see §11 for full details)
 
 ### RT policy by role
 
