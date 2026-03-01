@@ -95,15 +95,10 @@ All VTEPs use:
 
 - `address-family l2vpn evpn`
 - `neighbor TRANSIT_OVERLAY activate`
+- `advertise-all-vni` (required for BGP to discover local VNIs and originate EVPN routes)
 - `advertise-svi-ip`
 - explicit `vni 1000` block with manual RD/RTs
-
-### Important nuance: `advertise-all-vni` is not uniform
-
-- `vtep1` and `vtep2` explicitly configure `no advertise-all-vni`.
-- `vtep3` to `vtep7` currently have `advertise-all-vni` present.
-
-Because all nodes still define explicit `vni 1000` with manual RTs, the service intent remains hub/spoke. This mixed style is worth remembering when troubleshooting.
+- `frr defaults datacenter` (enables extended-community propagation and other datacenter BGP defaults)
 
 ### RT policy by role
 

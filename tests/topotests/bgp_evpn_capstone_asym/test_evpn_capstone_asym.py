@@ -766,9 +766,9 @@ def test_mobility(tgen):
     vtep3.run("mkdir -p {}".format(shlex.quote(vtep3_pcap_dir)))
 
     print(f"spine capture file: {pcap_file}")
+    print(f"controller capture file: {controller_pcap_file}")
     print(f"vtep2 capture file: {vtep2_pcap_file}")
     print(f"vtep3 capture file: {vtep3_pcap_file}")
-    print(f"controller capture file: {controller_pcap_file}")
 
     
     # Start tcpdump.
@@ -968,7 +968,7 @@ def test_mobility(tgen):
             f"  vtep2: {vtep2_pcap_file} (total_packets={vtep2_pcap_packets})"
         )
         print(f"    BGP UPDATE NLRI: {_fmt_nlri(vtep2_nlri)}")
-
+        print("")
         print(
             f"  vtep3: {vtep3_pcap_file} (total_packets={vtep3_pcap_packets})"
         )
