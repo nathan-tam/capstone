@@ -32,7 +32,6 @@ from debug_tools import verify_ping
 # pytest module level markers
 pytestmark = [
     pytest.mark.bgpd,
-    pytest.mark.pimd,
 ]
 
 #####################################################
@@ -128,9 +127,9 @@ def get_pcap_mp_nlri_counts(node, file_path):
         )
     ).strip()
 
-    # A single BGP UPDATE can carry both attributes, so we get count of packets with both attribute
+    # Count packets that carry both MP_REACH_NLRI (14) and MP_UNREACH_NLRI (15) in one UPDATE.
     both = node.run(
-        "tshark -r {0} -Y 'bgp.update.path_attribute.type_code == 14 || "
+        "tshark -r {0} -Y 'bgp.update.path_attribute.type_code == 14 && "
         "bgp.update.path_attribute.type_code == 15' 2>/dev/null | wc -l".format(path)
     ).strip()
 
@@ -141,7 +140,7 @@ def get_pcap_mp_nlri_counts(node, file_path):
             "both": int(both),
         }
     except ValueError:
-        # Returns a dict with keys 'mp_reach', 'mp_unreach', and 'both'. Returns missing if pcap file does not exist
+        # tshark returned unexpected output; pass raw strings through so the caller can log them.
         return {"mp_reach": mp_reach, "mp_unreach": mp_unreach, "both": both}
 
 def macvlan_endpoint_exists(tgen, host_name, vm_name):
