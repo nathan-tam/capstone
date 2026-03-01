@@ -851,7 +851,7 @@ def test_mobility(tgen):
                 sleep(1)
 
         # Wait for BGP/EVPN to stabilize.
-        sleep(3)
+        sleep(5)
 
         # --- Phase 2: post-deployment settle --- #
         print("\nPhase 2: Initial deployment complete; proceeding to mobility...")

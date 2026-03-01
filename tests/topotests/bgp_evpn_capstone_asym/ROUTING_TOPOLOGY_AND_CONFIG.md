@@ -117,14 +117,12 @@ All VTEPs use:
 
 Both spines currently include:
 
-- `bgp retain-route-target all`
 - `neighbor TRANSIT_OVERLAY send-community extended`
 - EVPN `neighbor TRANSIT_OVERLAY next-hop-unchanged`
 
 Both spines also define:
 
 - extcommunity list `EVPN-HUB-RT` = `rt 65000:1000`
-- extcommunity list `EVPN-SPOKE-RTS` = `rt 65000:1002..65000:1007`
 
 Route-maps:
 
@@ -199,3 +197,81 @@ If results do not match intent, check in this order:
 2. Hub neighbor vs spoke neighbors have the correct outbound route-map.
 3. RT import/export lines are correct for each VTEP role.
 4. Underlay reachability to EVPN next-hop loopbacks (`192.168.100.15..21`).
+
+## 11) Configuration command reference and verification notes
+
+This section records what was verified against the FRR source code and official documentation (verified 2026-03-01). Each command is explained so that future readers can understand why it is present and whether it is strictly required.
+
+---
+
+### `advertise-all-vni`
+
+**Required.** This is the master on/off switch for EVPN in FRR.
+
+Source: `bgpd/bgp_evpn.h` — `#define EVPN_ENABLED(bgp) (bgp)->advertise_all_vni`. The macro gates every EVPN route-origination code path (type-2, type-3, type-5). When the flag is clear, `bgp_zebra_advertise_all_vni()` is called with `advertise=0`, telling zebra to stop sending VNI add/delete notifications to BGP. As a result, no EVPN routes are ever originated, regardless of any `vni` block configuration underneath.
+
+FRR docs: *"The command to enable EVPN for a BGP instance is `advertise-all-vni`."*
+
+Without it — as was the case in the original vtep1/vtep2 configs — `mp_reach_nlri` in BGP UPDATEs will be 0.
+
+---
+
+### `next-hop-unchanged`
+
+**Required on spines.** Preserves the originating VTEP's loopback as the BGP next-hop when an eBGP spine re-advertises EVPN routes to other VTEPs.
+
+Source: `bgpd/bgp_updgrp_packet.c`. For eBGP peers, BGP normally rewrites the next-hop to its own address before sending an UPDATE (RFC 4271 §5.1.3). The flag `PEER_FLAG_NEXTHOP_UNCHANGED` bypasses this rewrite in both the route-announcement stage (`bgp_route.c`) and the packet-formation stage (`bgp_updgrp_packet.c`). Without it, all EVPN routes received by a VTEP would point at the spine as their next-hop; since the spine has no VXLAN termination, all tunnels would break.
+
+Must be configured per-neighbor under `address-family l2vpn evpn`.
+
+---
+
+### `send-community extended`
+
+**Technically redundant but kept for documentation.** Extended communities (which carry route-targets) are sent by default.
+
+Source: `bgpd/bgpd.c` — at peer creation time, `PEER_FLAG_SEND_COMMUNITY`, `PEER_FLAG_SEND_EXT_COMMUNITY`, and `PEER_FLAG_SEND_LARGE_COMMUNITY` are all set for every AFI/SAFI regardless of the active profile. There is no need to configure this explicitly. The CLI shows `no neighbor X send-community extended` only when the default is explicitly disabled.
+
+The explicit line is kept in the spine configs as a reminder that extended communities (carrying RTs) must flow through the transit node for the RT-based filtering to work at all.
+
+---
+
+### `bgp retain route-target all` — NOT used in this topology
+
+**This command does not apply to EVPN and must not be placed at the `router bgp` level.**
+
+Source: `bgpd/bgp_vty.c` — `install_element(BGP_VPNV4_NODE, ...)` / `install_element(BGP_VPNV6_NODE, ...)`. The command is only valid inside `address-family ipv4 vpn` or `address-family ipv6 vpn`. It controls a filter in `bgpd/bgp_route.c` that is guarded by `safi == SAFI_MPLS_VPN`; it has no effect on `SAFI_EVPN`.
+
+Additionally, the flag it sets (`BGP_VPNVX_RETAIN_ROUTE_TARGET_ALL`) defaults to **ON** at BGP instance creation, so even in an L3VPN context this command is only needed when `no bgp retain route-target all` has previously been applied.
+
+An earlier version of the spine configs incorrectly included this line at the `router bgp` level; this was removed.
+
+---
+
+### `frr defaults datacenter`
+
+**Recommended.** Applies a set of BGP defaults suited for datacenter/leaf-spine deployments.
+
+Source: `bgpd/bgp_vty.c` and `bgpd/bgp_vty.h`. Key changes relative to the `traditional` profile:
+
+| Setting | Datacenter | Traditional |
+|---|---|---|
+| `bgp ebgp-requires-policy` | **disabled** | enabled (≥ 7.4) |
+| BGP keepalive / hold | **3 s / 9 s** | 60 s / 180 s |
+| `bgp log-neighbor-changes` | enabled | disabled |
+| `bgp deterministic-med` | enabled | disabled |
+| Dynamic capability | enabled | disabled |
+
+The most operationally significant effect is disabling `ebgp-requires-policy`. Without the datacenter profile (or an explicit `no bgp ebgp-requires-policy`), eBGP neighbors without route-maps configured in both directions will silently drop all routes per RFC 8212.
+
+The `no bgp ebgp-requires-policy` line in each spine config is technically redundant with `frr defaults datacenter` but is kept for explicitness.
+
+---
+
+### `advertise-svi-ip`
+
+**Required on all VTEPs that have a routed SVI.** Advertises the SVI IP/MAC as a type-2 EVPN route, making the gateway IP reachable from remote VTEPs without flooding.
+
+FRR docs: *"This option advertises the SVI IP/MAC address as a type-2 route and eliminates the need for any flooding over VXLAN to reach the IP from a remote VTEP."*
+
+Do not combine with `advertise-default-gw`.
