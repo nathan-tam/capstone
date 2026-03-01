@@ -760,9 +760,15 @@ def test_mobility(tgen):
     vtep2_pcap_file = os.path.join(vtep2_pcap_dir, "vtep2_evpn_mobility.pcap")
     vtep2.run("mkdir -p {}".format(shlex.quote(vtep2_pcap_dir)))
 
+    vtep3 = tgen.gears["vtep3"]
+    vtep3_pcap_dir = os.path.join(tgen.logdir, "vtep3")
+    vtep3_pcap_file = os.path.join(vtep3_pcap_dir, "vtep3_evpn_mobility.pcap")
+    vtep3.run("mkdir -p {}".format(shlex.quote(vtep3_pcap_dir)))
+
     print(f"spine capture file: {pcap_file}")
-    print(f"controller capture file: {controller_pcap_file}")
     print(f"vtep2 capture file: {vtep2_pcap_file}")
+    print(f"vtep3 capture file: {vtep3_pcap_file}")
+    print(f"controller capture file: {controller_pcap_file}")
 
     
     # Start tcpdump.
@@ -781,7 +787,14 @@ def test_mobility(tgen):
         stdout=None,
     )
 
-    # Capture controller-VTEP view of mobility-related control-plane traffic.
+    vtep3.run(
+        "tcpdump -nni any -s 0 -w {} port 179 & echo $! > /tmp/tcpdump_evpn_vtep3.pid".format(
+            shlex.quote(vtep3_pcap_file)
+        ),
+        stdout=None,
+    )
+
+    # Capture controller-VTEP view of mobility-related control/data-plane traffic.
     controller_vtep.run(
         "tcpdump -nni any -s 0 -w {} port 179 & echo $! > /tmp/tcpdump_evpn_controller.pid".format(
             shlex.quote(controller_pcap_file)
@@ -789,7 +802,7 @@ def test_mobility(tgen):
         stdout=None,
     )
 
-    print("tcpdump started on spine1, vtep2, and controller VTEP")
+    print("tcpdump started on spine1, vtep2, vtep3, and controller VTEP")
 
     sleep(1)    # Give tcpdump a brief startup window before mobility begins.
 
@@ -902,6 +915,9 @@ def test_mobility(tgen):
         vtep2.run(
             "if [ -f /tmp/tcpdump_evpn_vtep2.pid ]; then kill $(cat /tmp/tcpdump_evpn_vtep2.pid); fi"
         )
+        vtep3.run(
+            "if [ -f /tmp/tcpdump_evpn_vtep3.pid ]; then kill $(cat /tmp/tcpdump_evpn_vtep3.pid); fi"
+        )
         spine.run("sleep 1")
 
         spine_pcap_packets = get_pcap_packet_count(
@@ -916,11 +932,16 @@ def test_mobility(tgen):
             vtep2,
             vtep2_pcap_file,
         )
+        vtep3_pcap_packets = get_pcap_packet_count(
+            vtep3,
+            vtep3_pcap_file,
+        )
 
         # Count only BGP UPDATEs carrying MP_REACH_NLRI / MP_UNREACH_NLRI.
         spine_nlri = get_pcap_mp_nlri_counts(spine, pcap_file)
         controller_nlri = get_pcap_mp_nlri_counts(controller_vtep, controller_pcap_file)
         vtep2_nlri = get_pcap_mp_nlri_counts(vtep2, vtep2_pcap_file)
+        vtep3_nlri = get_pcap_mp_nlri_counts(vtep3, vtep3_pcap_file)
 
         def _fmt_nlri(counts):
             """Format MP NLRI counts for display."""
@@ -945,6 +966,10 @@ def test_mobility(tgen):
             f"  vtep2: {vtep2_pcap_file} (total_packets={vtep2_pcap_packets})"
         )
         print(f"    BGP UPDATE NLRI: {_fmt_nlri(vtep2_nlri)}")
+        print(
+            f"  vtep3: {vtep3_pcap_file} (total_packets={vtep3_pcap_packets})"
+        )
+        print(f"    BGP UPDATE NLRI: {_fmt_nlri(vtep3_nlri)}")
 
         # Brief pause to keep capture summary visible before subsequent output.
         sleep(5)
