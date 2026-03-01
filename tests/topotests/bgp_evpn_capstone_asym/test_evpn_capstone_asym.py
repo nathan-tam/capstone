@@ -128,8 +128,8 @@ def get_pcap_mp_nlri_counts(node, file_path):
         )
     ).strip()
 
-    # A single BGP UPDATE can carry both attributes, so we get count of packets with either attribute
-    either = node.run(
+    # A single BGP UPDATE can carry both attributes, so we get count of packets with both attribute
+    both = node.run(
         "tshark -r {0} -Y 'bgp.update.path_attribute.type_code == 14 || "
         "bgp.update.path_attribute.type_code == 15' 2>/dev/null | wc -l".format(path)
     ).strip()
@@ -138,11 +138,11 @@ def get_pcap_mp_nlri_counts(node, file_path):
         return {
             "mp_reach": int(mp_reach),
             "mp_unreach": int(mp_unreach),
-            "either": int(either),
+            "both": int(both),
         }
     except ValueError:
-        # Returns a dict with keys 'mp_reach', 'mp_unreach', and 'either'. Returns missing if pcap file does not exist
-        return {"mp_reach": mp_reach, "mp_unreach": mp_unreach, "either": either}
+        # Returns a dict with keys 'mp_reach', 'mp_unreach', and 'both'. Returns missing if pcap file does not exist
+        return {"mp_reach": mp_reach, "mp_unreach": mp_unreach, "both": both}
 
 def macvlan_endpoint_exists(tgen, host_name, vm_name):
     """Return True when endpoint interface exists on the host."""
@@ -950,7 +950,7 @@ def test_mobility(tgen):
             return (
                 f"mp_reach={counts['mp_reach']}  "
                 f"mp_unreach={counts['mp_unreach']}  "
-                f"either={counts['either']}"
+                f"both={counts['both']}"
             )
 
         print("Packet captures saved:")
@@ -958,18 +958,23 @@ def test_mobility(tgen):
             f"  spine1: {pcap_file} (total_packets={spine_pcap_packets})"
         )
         print(f"    BGP UPDATE NLRI: {_fmt_nlri(spine_nlri)}")
+        print("")
         print(
             f"  {controller_vtep_name}: {controller_pcap_file} (total_packets={controller_pcap_packets})"
         )
         print(f"    BGP UPDATE NLRI: {_fmt_nlri(controller_nlri)}")
+        print("")
         print(
             f"  vtep2: {vtep2_pcap_file} (total_packets={vtep2_pcap_packets})"
         )
         print(f"    BGP UPDATE NLRI: {_fmt_nlri(vtep2_nlri)}")
+
         print(
             f"  vtep3: {vtep3_pcap_file} (total_packets={vtep3_pcap_packets})"
         )
         print(f"    BGP UPDATE NLRI: {_fmt_nlri(vtep3_nlri)}")
+
+        print("")
 
         # Brief pause to keep capture summary visible before subsequent output.
         sleep(5)
