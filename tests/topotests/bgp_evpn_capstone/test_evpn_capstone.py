@@ -79,7 +79,7 @@ except ValueError:
 try:
     MIGRATION_BATCH_SETTLE_SECONDS = max(
         0.0,
-        float(os.getenv("MIGRATION_BATCH_SETTLE_SECONDS", "0.5")),
+        float(os.getenv("MIGRATION_BATCH_SETTLE_SECONDS", "0.6")),
     )
 except ValueError:
     MIGRATION_BATCH_SETTLE_SECONDS = 0.6
@@ -949,10 +949,12 @@ def test_mobility(tgen):
             """Format MP NLRI counts for display."""
             if isinstance(counts, str):
                 return counts  # 'missing' or 'tshark-not-found'
+            total_nlri = counts['mp_reach'] + counts['mp_unreach'] - counts['both']
             return (
                 f"mp_reach={counts['mp_reach']}  "
                 f"mp_unreach={counts['mp_unreach']}  "
-                f"both={counts['both']}"
+                f"both={counts['both']}  "
+                f"total_nlri={total_nlri}"
             )
 
         print("Packet captures saved:")
