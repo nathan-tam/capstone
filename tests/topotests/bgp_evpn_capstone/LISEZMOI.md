@@ -56,7 +56,8 @@ Addressing:
 
 - create `NUM_MOBILE_VMS` MACVLAN endpoints
 - place endpoints round-robin across mobility-eligible hosts only
-- pause every 5 VMs, then wait 3 seconds for settling
+- sleep 1 second after every 5 VMs to allow BGP/EVPN updates to propagate
+- after all VMs are deployed, sleep 3 seconds for final settling
 
 ### Phase 2: Post-deployment settle
 
@@ -84,7 +85,7 @@ Safety rollback behavior:
 
 ### Post-mobility spot-check (always runs)
 
-After migration rounds complete (and before the 3-second pause), the test runs six informational pings:
+After migration rounds complete, the test sleeps 5 seconds (to let BGP/EVPN updates settle), then runs up to six informational pings, then sleeps 3 more seconds:
 
 1. controller endpoint -> 3 deterministic-random VM IPs (`POST_MOBILITY_SPOTCHECK_SEED`)
 2. one VM currently on VTEP2 -> controller endpoint
@@ -103,22 +104,32 @@ Captures started during the test:
 - spine capture
   - node: `spine1`
   - file: `{logdir}/spine1/spine1_evpn_mobility.pcap`
-  - filter: `tcp port 179`
-- vtep capture
+  - filter: `port 179`
+- vtep2 capture
   - node: `vtep2`
   - file: `{logdir}/vtep2/vtep2_evpn_mobility.pcap`
-  - filter: `tcp port 179`
+  - filter: `port 179`
+- vtep3 capture
+  - node: `vtep3`
+  - file: `{logdir}/vtep3/vtep3_evpn_mobility.pcap`
+  - filter: `port 179`
 - controller-VTEP capture
   - node: current controller VTEP (default `vtep1`)
   - file: `{logdir}/{controller_vtep}/{controller_vtep}_evpn_controller_mobility.pcap`
-  - filter: `tcp port 179`
+  - filter: `port 179`
 
 Teardown summary prints, per capture:
 
 - capture file path
-- packet count status from `get_pcap_packet_count()`:
+- total packet count from `get_pcap_packet_count()`:
   - numeric count
   - `missing` (if file was not created)
+- BGP UPDATE NLRI breakdown from `get_pcap_mp_nlri_counts()`:
+  - `mp_reach` (type-14 MP_REACH_NLRI packets)
+  - `mp_unreach` (type-15 MP_UNREACH_NLRI packets)
+  - `both` (packets carrying both attributes in one UPDATE)
+  - `total_nlri` (mp_reach + mp_unreach - both)
+  - `missing` or `tshark-not-found` if applicable
 
 Then the test sleeps 5 seconds before continuing cleanup output.
 
@@ -128,20 +139,21 @@ Then the test sleeps 5 seconds before continuing cleanup output.
 
 - `NUM_VTEPS = 7`
 - `NUM_HOSTS = 7`
-- `NUM_MOBILE_VMS = 20`
 - `CONTROLLER_VTEPS = {"vtep1"}`
 - `POST_MOBILITY_SPOTCHECK_SEED = 42`
 
 ### Environment variables consumed by the test
 
+- `NUM_MOBILE_VMS`
+  - default: `20`
 - `MOBILITY_OVERLAP_SECONDS`
   - default: `0.2`
 - `MIGRATION_BATCH_SIZE`
   - default: `5`
 - `MIGRATION_BATCH_SETTLE_SECONDS`
-  - default: `0.5`
+  - default: `0.6`
 - `MIGRATION_REPEAT_COUNT`
-  - default: `3`
+  - default: `5`
 - `ENABLE_MIGRATION_BATCH_SAFETY_ROLLBACK`
   - default: `true`
 - `MUNET_CLI`
