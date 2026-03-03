@@ -41,7 +41,10 @@ pytestmark = [
 # Test scaling parameters
 NUM_VTEPS = 7
 NUM_HOSTS = 7  # One host per VTEP for VM mobility testing
-NUM_MOBILE_VMS = 20 # Number of VMs that will move around
+try:
+    NUM_MOBILE_VMS = max(1, int(os.getenv("NUM_MOBILE_VMS", "20")))
+except ValueError:
+    NUM_MOBILE_VMS = 20
 
 # Controller VTEPs participate in topology/BGP but are excluded from endpoint mobility.
 CONTROLLER_VTEPS = {"vtep1"}
@@ -68,9 +71,9 @@ except ValueError:
 # Number of full migration rounds to run in phase 3.
 # Example: 3 means move the full VM set three times, one full pass per round.
 try:
-    MIGRATION_REPEAT_COUNT = max(1, int(os.getenv("MIGRATION_REPEAT_COUNT", "3")))
+    MIGRATION_REPEAT_COUNT = max(1, int(os.getenv("MIGRATION_REPEAT_COUNT", "5")))
 except ValueError:
-    MIGRATION_REPEAT_COUNT = 3
+    MIGRATION_REPEAT_COUNT = 5
 
 # Optional settle delay between migration batches.
 try:
