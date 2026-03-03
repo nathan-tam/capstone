@@ -776,21 +776,21 @@ def test_mobility(tgen):
     # Start tcpdump.
     spine.run(
         # Run detached with full packet capture; save PID for cleanup.
-        "tcpdump -nni any -s 0 -w {} port 179 & echo $! > /tmp/tcpdump_evpn.pid".format(
+        "tcpdump -nni any -s 0 -w {} port 179 2>/dev/null & echo $! > /tmp/tcpdump_evpn.pid".format(
             shlex.quote(pcap_file)
         ),
         stdout=None,
     )
 
     vtep2.run(
-        "tcpdump -nni any -s 0 -w {} port 179 & echo $! > /tmp/tcpdump_evpn_vtep2.pid".format(
+        "tcpdump -nni any -s 0 -w {} port 179 2>/dev/null & echo $! > /tmp/tcpdump_evpn_vtep2.pid".format(
             shlex.quote(vtep2_pcap_file)
         ),
         stdout=None,
     )
 
     vtep3.run(
-        "tcpdump -nni any -s 0 -w {} port 179 & echo $! > /tmp/tcpdump_evpn_vtep3.pid".format(
+        "tcpdump -nni any -s 0 -w {} port 179 2>/dev/null & echo $! > /tmp/tcpdump_evpn_vtep3.pid".format(
             shlex.quote(vtep3_pcap_file)
         ),
         stdout=None,
@@ -798,7 +798,7 @@ def test_mobility(tgen):
 
     # Capture controller-VTEP view of mobility-related control/data-plane traffic.
     controller_vtep.run(
-        "tcpdump -nni any -s 0 -w {} port 179 & echo $! > /tmp/tcpdump_evpn_controller.pid".format(
+        "tcpdump -nni any -s 0 -w {} port 179 2>/dev/null & echo $! > /tmp/tcpdump_evpn_controller.pid".format(
             shlex.quote(controller_pcap_file)
         ),
         stdout=None,
@@ -910,6 +910,7 @@ def test_mobility(tgen):
         print("\nPhase 4: Post-migration checks complete.")
     finally:
         # Stop capture and flush output.
+        print("\nStopping tcpdump on spine1, vtep2, vtep3, and controller VTEP...")
         spine.run("if [ -f /tmp/tcpdump_evpn.pid ]; then kill $(cat /tmp/tcpdump_evpn.pid); fi")
         controller_vtep.run(
             "if [ -f /tmp/tcpdump_evpn_controller.pid ]; then kill $(cat /tmp/tcpdump_evpn_controller.pid); fi"
