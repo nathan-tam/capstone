@@ -22,6 +22,22 @@ This section assumes you have already completed the FRR Workspace Setup Guide fr
 1. Change into the test directory: 
 2. Use `sudo -E pytest -s bgp_evpn_capstone` to run the test without pauses.
 3. Use `sudo -E pytest -s --pause --vtysh=spine1 bgp_evpn_capstone` to run the test with a pause, dropping you into the `spine1` node before the test runs. Note that the test will continue to run as you're 'consoled' into the node.
+
+### Tunables
+All simulation parameters can be overridden with environment variables. Place them before `sudo` so that `sudo -E` passes them through:
+
+```bash
+NUM_MOBILE_VMS=50 SIMULATION_DURATION_SECONDS=120 VM_MOVE_PROBABILITY=0.05 \
+  sudo -E pytest -s bgp_evpn_capstone
+```
+
+| Variable | Default | Description |
+|---|---|---|
+| `NUM_MOBILE_VMS` | 30 | Number of mobile VM endpoints to create |
+| `SIMULATION_DURATION_SECONDS` | 60 | Wall-clock duration of the random-movement simulation |
+| `SIMULATION_TICK_SECONDS` | 1.0 | Seconds between each tick (evaluation round) |
+| `VM_MOVE_PROBABILITY` | 0.1 | Per-tick probability that any single VM will move (0.0–1.0) |
+| `MOBILITY_OVERLAP_SECONDS` | 0.2 | Duplicate-MAC overlap window during each move |
 ### Packet Capturing
 When the test runs it automatically captures BGP packets from a few nodes. If you'd like to get the `.pcap` file off the container and onto your host machine to analyze with Wireshark the files are saved to:
 `/tmp/topotests/bgp_evpn_capstone.test_evpn_capstone/<node>/<node>_evpn_mobility.pcap`

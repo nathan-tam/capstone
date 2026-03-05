@@ -15,6 +15,7 @@ import os
 import sys
 import shlex
 import random
+import time
 from time import sleep
 import platform
 import pytest
@@ -62,34 +63,23 @@ try:
 except ValueError:
     MOBILITY_OVERLAP_SECONDS = 0.2
 
-# Number of endpoints to move together during phase 3 migration.
+# Duration of the time-based random-movement simulation (seconds).
 try:
-    MIGRATION_BATCH_SIZE = max(1, int(os.getenv("MIGRATION_BATCH_SIZE", "5")))
+    SIMULATION_DURATION_SECONDS = max(1, int(os.getenv("SIMULATION_DURATION_SECONDS", "60")))
 except ValueError:
-    MIGRATION_BATCH_SIZE = 5
+    SIMULATION_DURATION_SECONDS = 60
 
-# Number of full migration rounds to run in phase 3.
-# Example: 3 means move the full VM set three times, one full pass per round.
+# How often (seconds) to evaluate each VM for a possible move.
 try:
-    MIGRATION_REPEAT_COUNT = max(1, int(os.getenv("MIGRATION_REPEAT_COUNT", "5")))
+    SIMULATION_TICK_SECONDS = max(0.1, float(os.getenv("SIMULATION_TICK_SECONDS", "1.0")))
 except ValueError:
-    MIGRATION_REPEAT_COUNT = 5
+    SIMULATION_TICK_SECONDS = 1.0
 
-# Optional settle delay between migration batches.
+# Per-tick probability that any single VM will move (0.0 – 1.0).
 try:
-    MIGRATION_BATCH_SETTLE_SECONDS = max(
-        0.0,
-        float(os.getenv("MIGRATION_BATCH_SETTLE_SECONDS", "0.6")),
-    )
+    VM_MOVE_PROBABILITY = min(1.0, max(0.0, float(os.getenv("VM_MOVE_PROBABILITY", "0.1"))))
 except ValueError:
-    MIGRATION_BATCH_SETTLE_SECONDS = 0.6
-
-# Safety mode: if batch destination creation partially fails, roll back already-created
-# destination endpoints in that batch before re-raising the error.
-ENABLE_MIGRATION_BATCH_SAFETY_ROLLBACK = (
-    os.getenv("ENABLE_MIGRATION_BATCH_SAFETY_ROLLBACK", "true").strip().lower()
-    not in {"0", "false", "no", "off"}
-)
+    VM_MOVE_PROBABILITY = 0.1
 
 # Fixed seed used for deterministic random VM spot-check selection.
 POST_MOBILITY_SPOTCHECK_SEED = 42
@@ -199,70 +189,40 @@ def build_vm_migration_plan(vm_idx, vm_locations, mobility_vtep_indices, mobilit
     }
 
 
-def migrate_macvlan_endpoints_live_batch(tgen, migration_batch):
-    """Move a batch by creating all destinations first, then deleting all sources."""
-    created_destinations = []
+def migrate_vm(tgen, vm_idx, vm_locations, mobility_vtep_indices, mobility_host_indices):
+    """Migrate a single VM to a different VTEP and return the migration details."""
+    plan = build_vm_migration_plan(
+        vm_idx, vm_locations, mobility_vtep_indices, mobility_host_indices
+    )
 
-    try:
-        for migration in migration_batch:
-            create_macvlan_endpoint(
-                tgen,
-                migration["new_host_name"],
-                migration["vm_name"],
-                migration["vm_ip"],
-                migration["vm_mac"],
-            )
+    vm_name = plan["vm_name"]
+    old_host = plan["old_host_name"]
+    new_host = plan["new_host_name"]
 
-            if not macvlan_endpoint_exists(
-                tgen,
-                migration["new_host_name"],
-                migration["vm_name"],
-            ):
-                raise AssertionError(
-                    f"destination endpoint {migration['vm_name']} missing on {migration['new_host_name']} after create"
-                )
+    # Create endpoint at destination.
+    create_macvlan_endpoint(tgen, new_host, vm_name, plan["vm_ip"], plan["vm_mac"])
 
-            created_destinations.append(
-                (migration["new_host_name"], migration["vm_name"])
-            )
-    except Exception as error:
-        if ENABLE_MIGRATION_BATCH_SAFETY_ROLLBACK and created_destinations:
-            print(
-                "WARNING: batch migration destination create failed; "
-                f"rolling back {len(created_destinations)} created endpoints before aborting. "
-                f"Error: {error}"
-            )
-            for host_name, vm_name in reversed(created_destinations):
-                delete_macvlan_endpoint_if_exists(tgen, host_name, vm_name)
-        else:
-            print(
-                "WARNING: batch migration destination create failed with no rollback applied. "
-                f"Error: {error}"
-            )
-        raise
+    if not macvlan_endpoint_exists(tgen, new_host, vm_name):
+        raise AssertionError(
+            f"destination endpoint {vm_name} missing on {new_host} after create"
+        )
 
+    # Brief overlap window (duplicate-MAC on both old and new host).
     sleep(MOBILITY_OVERLAP_SECONDS)
 
-    for migration in migration_batch:
-        delete_macvlan_endpoint(
-            tgen,
-            migration["old_host_name"],
-            migration["vm_name"],
+    # Delete endpoint from source.
+    delete_macvlan_endpoint(tgen, old_host, vm_name)
+    if macvlan_endpoint_exists(tgen, old_host, vm_name):
+        print(
+            f"WARNING: source endpoint still present after delete; forcing cleanup for "
+            f"{vm_name} on {old_host}"
         )
-        if macvlan_endpoint_exists(
-            tgen,
-            migration["old_host_name"],
-            migration["vm_name"],
-        ):
-            print(
-                "WARNING: source endpoint still present after delete; forcing cleanup for "
-                f"{migration['vm_name']} on {migration['old_host_name']}"
-            )
-            delete_macvlan_endpoint_if_exists(
-                tgen,
-                migration["old_host_name"],
-                migration["vm_name"],
-            )
+        delete_macvlan_endpoint_if_exists(tgen, old_host, vm_name)
+
+    # Update tracking.
+    vm_locations[vm_name] = (plan["new_host_idx"], plan["new_vtep_idx"])
+
+    return plan
 
 vtep_ips = {
     f"vtep{i}": f"192.168.100.{14 + i}"
@@ -707,17 +667,11 @@ def run_post_mobility_controller_spotcheck(tgen, num_mobile_vms, vm_locations):
 
 def test_mobility(tgen):
     """
-    Simulate endpoint mobility across VTEPs while keeping controller VTEPs static.
+    Simulate random endpoint mobility across VTEPs over a fixed time window.
 
-    This test drives repeated duplicate-MAC windows (destination create before
-    source delete) to stress EVPN control-plane convergence.
-
-    Steps:
-    1. Deploy mobile VMs distributed across hosts (one per VTEP)
-    2. Verify controller endpoint can reach all VM IPs at initial locations
-    3. Live-migrate the full VM set one or more rounds (brief duplicate-MAC window)
-    4. Verify controller endpoint can still reach all VM IPs after migration
-    5. Capture BGP packet data during migrations
+    Each VM independently has a random chance of moving every tick.
+    Individual moves are printed to console as they happen.
+    BGP packet captures run throughout the simulation for analysis.
     """
 
     controller_host_idx = int(CONTROLLER_ENDPOINT_HOST.replace("host", ""))
@@ -739,10 +693,9 @@ def test_mobility(tgen):
     #####################################################
     print("\nStarting packet capture on spine1, vtep2, and controller VTEP...")
     print(f"Using mobility overlap timer: {MOBILITY_OVERLAP_SECONDS:.3f}s")
-    print(f"Migration batch size: {MIGRATION_BATCH_SIZE}")
-    print(f"Migration repeat count: {MIGRATION_REPEAT_COUNT}")
-    print(f"Batch settle timer: {MIGRATION_BATCH_SETTLE_SECONDS:.3f}s")
-    print(f"Batch safety rollback: {ENABLE_MIGRATION_BATCH_SAFETY_ROLLBACK}")
+    print(f"Simulation duration: {SIMULATION_DURATION_SECONDS}s")
+    print(f"Simulation tick interval: {SIMULATION_TICK_SECONDS:.2f}s")
+    print(f"Per-tick VM move probability: {VM_MOVE_PROBABILITY:.3f}")
     
     spine = tgen.gears["spine1"]                                # Run packet capture on spine1.
     pcap_dir = os.path.join(tgen.logdir, "spine1")              # Store output in the test log directory.
@@ -815,99 +768,84 @@ def test_mobility(tgen):
         #####################################################
         # SECTION: Mobility Simulation
         #####################################################
-        print("\n=== Starting Mobility Simulation Test with {} VMs ===\n".format(NUM_MOBILE_VMS))
+        print("\n=== Starting Mobility Simulation with {} VMs ===\n".format(NUM_MOBILE_VMS))
 
         # Track VM locations as: {vm_name: (current_host, current_vtep_idx)}.
         vm_locations = {}
 
-        # --- Phase 1: deploy VMs on initial hosts --- #
-        print(f"Phase 1: Deploying {NUM_MOBILE_VMS} VMs on hosts...")
-        
-        # Create mobile endpoints and record initial placement.
+        # Deploy VMs on initial hosts.
+        print(f"Deploying {NUM_MOBILE_VMS} VMs across mobility-eligible hosts...")
+
         for vm_idx in range(1, NUM_MOBILE_VMS + 1):
-            # VM naming scheme: vm1, vm2, ..., vmN.
             vm_name = f"vm{vm_idx}"
-            
-            # Use 192.168.100.x for mobile VMs (up to 254 VMs).
             vm_ip = f"192.168.100.{vm_idx}/16"
-            
-            # Generate a deterministic MAC from the VM index using bit shifts.
             vm_mac = "00:aa:bb:cc:{:02x}:{:02x}".format((vm_idx >> 8) & 0xFF, vm_idx & 0xFF)
 
-            # Distribute VMs round-robin across mobility-eligible hosts only.
             host_idx = mobility_host_indices[(vm_idx - 1) % len(mobility_host_indices)]
             host_name = f"host{host_idx}"
-            
-            # Determine which VTEP this host is connected to.
             vtep_idx = host_to_vtep_index(host_idx)
 
-            # Create the MACVLAN endpoint to simulate the VM.
             create_macvlan_endpoint(tgen, host_name, vm_name, vm_ip, vm_mac)
-            
-            # Add the VM to the tracking dictionary.
             vm_locations[vm_name] = (host_idx, vtep_idx)
 
-            # Every 5 VMs, pause briefly to allow BGP/EVPN updates.
             if vm_idx % 5 == 0:
-                # Give BGP/EVPN a moment to advertise between VM additions.
                 sleep(1)
 
-        # Wait for BGP/EVPN to stabilize.
         sleep(5)
+        print("Deployment complete. Starting random movement...\n")
 
-        # --- Phase 2: post-deployment settle --- #
-        print("\nPhase 2: Initial deployment complete; proceeding to mobility...")
-
-        # --- Phase 3: migrate VMs to different VTEPs --- #
+        # Run random-movement simulation for the configured duration.
+        # Each tick, every VM independently rolls for a chance to migrate.
+        # Moves are printed individually to console.
         print(
-            f"\nPhase 3: Moving {NUM_MOBILE_VMS} VMs to different locations "
-            f"for {MIGRATION_REPEAT_COUNT} round(s)..."
+            f"Running for {SIMULATION_DURATION_SECONDS}s  "
+            f"(tick={SIMULATION_TICK_SECONDS:.2f}s, "
+            f"move_probability={VM_MOVE_PROBABILITY:.3f})\n"
         )
-        print("(Creating at destination while source exists, then cleaning up source)")
 
-        for migration_round in range(1, MIGRATION_REPEAT_COUNT + 1):
-            print(f"  Starting migration round {migration_round}/{MIGRATION_REPEAT_COUNT}")
+        rng = random.Random()           # unseeded for true randomness each run
+        sim_start = time.time()
+        tick_number = 0
+        total_moves = 0
 
-            for batch_start in range(1, NUM_MOBILE_VMS + 1, MIGRATION_BATCH_SIZE):
-                batch_end = min(batch_start + MIGRATION_BATCH_SIZE - 1, NUM_MOBILE_VMS)
-                migration_batch = []
+        while time.time() - sim_start < SIMULATION_DURATION_SECONDS:
+            tick_number += 1
+            elapsed = time.time() - sim_start
 
-                for vm_idx in range(batch_start, batch_end + 1):
-                    migration_batch.append(
-                        build_vm_migration_plan(
-                            vm_idx,
-                            vm_locations,
-                            mobility_vtep_indices,
-                            mobility_host_indices,
-                        )
+            tick_moves = 0
+            for vm_idx in range(1, NUM_MOBILE_VMS + 1):
+                if rng.random() < VM_MOVE_PROBABILITY:
+                    plan = migrate_vm(
+                        tgen, vm_idx, vm_locations,
+                        mobility_vtep_indices, mobility_host_indices,
                     )
-
-                migrate_macvlan_endpoints_live_batch(tgen, migration_batch)
-
-                for migration in migration_batch:
-                    vm_locations[migration["vm_name"]] = (
-                        migration["new_host_idx"],
-                        migration["new_vtep_idx"],
-                    )
-
-                moved_count = batch_end
-                if moved_count % 20 == 0 or moved_count == NUM_MOBILE_VMS:
+                    tick_moves += 1
+                    total_moves += 1
                     print(
-                        f"  Round {migration_round}/{MIGRATION_REPEAT_COUNT} progress: "
-                        f"{moved_count}/{NUM_MOBILE_VMS}"
+                        f"  [{elapsed:6.1f}s] {plan['vm_name']}: "
+                        f"{plan['old_host_name']} -> {plan['new_host_name']} "
+                        f"(vtep{plan['new_vtep_idx']})  "
+                        f"[move #{total_moves}]"
                     )
 
-                if MIGRATION_BATCH_SETTLE_SECONDS > 0.0:
-                    sleep(MIGRATION_BATCH_SETTLE_SECONDS)
+            if tick_moves == 0 and tick_number % 10 == 0:
+                print(f"  [{elapsed:6.1f}s] tick {tick_number}: no moves (total: {total_moves})")
 
-        # Wait for all BGP/EVPN updates to process.
+            sleep(SIMULATION_TICK_SECONDS)
+
+        sim_elapsed = time.time() - sim_start
+        print(
+            f"\nSimulation finished: {tick_number} ticks, "
+            f"{total_moves} total moves in {sim_elapsed:.1f}s"
+        )
+
+        # Wait for BGP/EVPN to process remaining updates.
         sleep(5)
 
         run_post_mobility_controller_spotcheck(tgen, NUM_MOBILE_VMS, vm_locations)
         sleep(3)
 
-        # --- Phase 4: post-migration continuation --- #
-        print("\nPhase 4: Post-migration checks complete.")
+        print("\nPost-simulation checks complete.")
     finally:
         # Stop capture and flush output.
         print("\nStopping tcpdump on spine1, vtep2, vtep3, and controller VTEP...")
