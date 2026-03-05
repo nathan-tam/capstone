@@ -39,17 +39,41 @@ NUM_MOBILE_VMS=50 SIMULATION_DURATION_SECONDS=120 VM_MOVE_PROBABILITY=0.05 \
 | `VM_MOVE_PROBABILITY` | 0.1 | Per-tick probability that any single VM will move (0.0–1.0) |
 | `MOBILITY_OVERLAP_SECONDS` | 0.2 | Duplicate-MAC overlap window during each move |
 ### Packet Capturing
-When the test runs it automatically captures BGP packets from a few nodes. If you'd like to get the `.pcap` file off the container and onto your host machine to analyze with Wireshark the files are saved to:
+When the test runs it automatically captures BGP packets from a few nodes. If you'd like to get the `.pcap` files off the container and onto your host machine to analyze with Wireshark, the captures are saved at:
 `/tmp/topotests/bgp_evpn_capstone.test_evpn_capstone/<node>/<node>_evpn_mobility.pcap`
+Note that every time you run the test it will overwrite the previous `.pcap` files.
 <br>
 Once you have the path to your desired file you can run this command on your host to copy it down:
 ```command
 docker cp <container_id>:/path/to/evpn_mobility.pcap ./evpn_mobility.pcap
 ```
+⚠️**Minor Warning**⚠️
+<br>
 The test itself will print out some statisics about the capture at the very end, such as the total number of packets captured and how many of those were `MP_UNREACH_NLRI` and `MP_REACH_NLRI` messages.
-Note that every time you run the test it will overwrite the previous `.pcap` files.
+However, BGP will bundle together multiple `MP_UNREACH_NLRI` and `MP_REACH_NLRI` messages into a single packet. Therefore, it may be necessary to count each instance of the string in the entire capture instead of the number of packets that contain it. Luckily, there's a (somewhat comlpex) command for that. It's dangerous to go alone! Take this:
+```command
+tshark -r evpn_mobility.pcap -V -Y "bgp" | grep -o "Path Attribute - MP_UNREACH_NLRI" | wc -l
+```
 
 #### Wireshark
 To filter for BGP Update packets (remember, Withdraw messages are part of Update messages) we can use the following Wireshark filters to find what we're looking for:
 * `bgp.type == 2` will show all BGP Update messages captured.
 * `bgp.update.path_attribute.type_code == 15` will show all BGP messages that contain `MP_UNREACH_NLRI`, useful for double checking numbers. Type code 14 will show messages with `MP_REACH_NLRI`.
+
+### Measurements
+Here are some results from our experiments! All message counts were obtained by searching for all appearances of the attribute string, as described in the previous Packet Capturing section of this document.
+
+#### 64 Robots
+Running the test for 120 seconds with 64 robots and a 33% (0.33) chance of movement probability results in these numbers on the `spine1` node:
+* 62    `MP_UNREACH_NLRI` packets.
+* 1414  `MP_REACH_NLRI` packets.
+
+#### 128 Robots
+Running the test for 120 seconds with 128 robots and a 33% (0.33) chance of movement probability results in these numbers on the `spine1` node:
+* 97    `MP_UNREACH_NLRI` packets.
+* 1813  `MP_REACH_NLRI` packets.
+
+#### 256 Robots
+Running the test for 120 seconds with 252 robots and a 33% (0.33) chance of movement probability results in these numbers on the `spine1` node:
+* 114   `MP_UNREACH_NLRI` packets.
+* 2281  `MP_REACH_NLRI` packets.
