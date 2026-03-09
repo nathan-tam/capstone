@@ -27,8 +27,8 @@ This section assumes you have already completed the FRR Workspace Setup Guide fr
 All simulation parameters can be overridden with environment variables. Place them before `sudo` so that `sudo -E` passes them through:
 
 ```bash
-NUM_MOBILE_VMS=50 SIMULATION_DURATION_SECONDS=120 VM_MOVE_PROBABILITY=0.05 \
-  sudo -E pytest -s bgp_evpn_capstone
+NUM_MOBILE_VMS=64 SIMULATION_DURATION_SECONDS=120 VM_MOVE_PROBABILITY=0.05 \
+  sudo -E pytest -s bgp_evpn_capstone_asym
 ```
 
 | Variable | Default | Description |
@@ -40,7 +40,7 @@ NUM_MOBILE_VMS=50 SIMULATION_DURATION_SECONDS=120 VM_MOVE_PROBABILITY=0.05 \
 | `MOBILITY_OVERLAP_SECONDS` | 0.2 | Duplicate-MAC overlap window during each move |
 ### Packet Capturing
 When the test runs it automatically captures BGP packets from a few nodes. If you'd like to get the `.pcap` files off the container and onto your host machine to analyze with Wireshark, the captures are saved at:
-`/tmp/topotests/bgp_evpn_capstone.test_evpn_capstone/<node>/<node>_evpn_mobility.pcap`
+`/tmp/topotests/bgp_evpn_capstone.test_evpn_capstone/<node>/<node>_evpn_mobility.pcap`<br>
 Note that every time you run the test it will overwrite the previous `.pcap` files.
 <br>
 Once you have the path to your desired file you can run this command on your host to copy it down:
@@ -73,7 +73,7 @@ Running the test for 120 seconds with 128 robots and a 33% (0.33) chance of move
 * 97    `MP_UNREACH_NLRI` packets.
 * 1813  `MP_REACH_NLRI` packets.
 
-#### 256 Robots
+#### 252 Robots
 Running the test for 120 seconds with 252 robots and a 33% (0.33) chance of movement probability results in these numbers on the `spine1` node:
 * 114   `MP_UNREACH_NLRI` packets.
 * 2281  `MP_REACH_NLRI` packets.

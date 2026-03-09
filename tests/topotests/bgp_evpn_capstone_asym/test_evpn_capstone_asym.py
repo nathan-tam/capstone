@@ -185,40 +185,46 @@ def build_vm_migration_plan(vm_idx, vm_locations, mobility_vtep_indices, mobilit
     }
 
 
-def migrate_vm(tgen, vm_idx, vm_locations, mobility_vtep_indices, mobility_host_indices):
-    """Migrate a single VM to a different VTEP and return the migration details."""
-    plan = build_vm_migration_plan(
-        vm_idx, vm_locations, mobility_vtep_indices, mobility_host_indices
-    )
+def migrate_vms(tgen, vm_indices, vm_locations, mobility_vtep_indices, mobility_host_indices):
+    """
+    Migrate multiple VMs in bulk: create all destinations, wait once for the
+    overlap window, then delete all sources.  This avoids paying a per-VM
+    sleep cost and keeps tick duration independent of how many VMs move.
+    """
+    plans = [
+        build_vm_migration_plan(idx, vm_locations, mobility_vtep_indices, mobility_host_indices)
+        for idx in vm_indices
+    ]
 
-    vm_name = plan["vm_name"]
-    old_host = plan["old_host_name"]
-    new_host = plan["new_host_name"]
-
-    # Create endpoint at destination.
-    create_macvlan_endpoint(tgen, new_host, vm_name, plan["vm_ip"], plan["vm_mac"])
-
-    if not macvlan_endpoint_exists(tgen, new_host, vm_name):
-        raise AssertionError(
-            f"destination endpoint {vm_name} missing on {new_host} after create"
+    # 1. Create every destination endpoint.
+    for plan in plans:
+        create_macvlan_endpoint(
+            tgen, plan["new_host_name"], plan["vm_name"], plan["vm_ip"], plan["vm_mac"]
         )
+        if not macvlan_endpoint_exists(tgen, plan["new_host_name"], plan["vm_name"]):
+            raise AssertionError(
+                f"destination endpoint {plan['vm_name']} missing on "
+                f"{plan['new_host_name']} after create"
+            )
 
-    # Brief overlap window (duplicate-MAC on both old and new host).
+    # 2. One overlap window for the entire group.
     sleep(MOBILITY_OVERLAP_SECONDS)
 
-    # Delete endpoint from source.
-    delete_macvlan_endpoint(tgen, old_host, vm_name)
-    if macvlan_endpoint_exists(tgen, old_host, vm_name):
-        print(
-            f"WARNING: source endpoint still present after delete; forcing cleanup for "
-            f"{vm_name} on {old_host}"
-        )
-        delete_macvlan_endpoint_if_exists(tgen, old_host, vm_name)
+    # 3. Delete every source endpoint.
+    for plan in plans:
+        delete_macvlan_endpoint(tgen, plan["old_host_name"], plan["vm_name"])
+        if macvlan_endpoint_exists(tgen, plan["old_host_name"], plan["vm_name"]):
+            print(
+                f"WARNING: source endpoint still present after delete; forcing cleanup for "
+                f"{plan['vm_name']} on {plan['old_host_name']}"
+            )
+            delete_macvlan_endpoint_if_exists(tgen, plan["old_host_name"], plan["vm_name"])
 
-    # Update tracking.
-    vm_locations[vm_name] = (plan["new_host_idx"], plan["new_vtep_idx"])
+    # 4. Update tracking.
+    for plan in plans:
+        vm_locations[plan["vm_name"]] = (plan["new_host_idx"], plan["new_vtep_idx"])
 
-    return plan
+    return plans
 
 vtep_ips = {
     f"vtep{i}": f"192.168.100.{14 + i}"
@@ -705,23 +711,31 @@ def test_mobility(tgen):
             tick_number += 1
             elapsed = time.time() - sim_start
 
-            tick_moves = 0
-            for vm_idx in range(1, NUM_MOBILE_VMS + 1):
-                if rng.random() < VM_MOVE_PROBABILITY:
-                    plan = migrate_vm(
-                        tgen, vm_idx, vm_locations,
-                        mobility_vtep_indices, mobility_host_indices,
-                    )
-                    tick_moves += 1
-                    total_moves += 1
+            # Roll for each VM independently; collect the ones that move.
+            movers = [
+                vm_idx
+                for vm_idx in range(1, NUM_MOBILE_VMS + 1)
+                if rng.random() < VM_MOVE_PROBABILITY
+            ]
+
+            if movers:
+                # Migrate all movers in bulk (single overlap sleep).
+                plans = migrate_vms(
+                    tgen, movers, vm_locations,
+                    mobility_vtep_indices, mobility_host_indices,
+                )
+                total_moves += len(plans)
+                for plan in plans:
                     print(
                         f"  [{elapsed:6.1f}s] {plan['vm_name']}: "
                         f"{plan['old_host_name']} -> {plan['new_host_name']} "
-                        f"(vtep{plan['new_vtep_idx']})  "
-                        f"[move #{total_moves}]"
+                        f"(vtep{plan['new_vtep_idx']})"
                     )
-
-            if tick_moves == 0 and tick_number % 10 == 0:
+                print(
+                    f"  [{elapsed:6.1f}s] tick {tick_number}: "
+                    f"{len(plans)} move(s) this tick  (total: {total_moves})"
+                )
+            elif tick_number % 10 == 0:
                 print(f"  [{elapsed:6.1f}s] tick {tick_number}: no moves (total: {total_moves})")
 
             sleep(SIMULATION_TICK_SECONDS)
