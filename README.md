@@ -4,19 +4,19 @@ This documentation details the methodology used to simulate Host Mobility in an 
 "Host Mobility" usually refers to a host migrating from one Access Point to another while retaining its MAC and IP address. The network fabric (EVPN) must detect this move and update its routing tables to send traffic to the new location.<br>
 Simulating this in a containerized network test environment (Mininet/Topotest) is challenging because we don't have real hosts to move around. We attempt to simulate this behavior using Linux MACVLAN interfaces.
 ### Simulation
-Instead of moving physical hosts, we use Linux MACVLAN interfaces to represent endpoints. Essentially, we deploy a dummy switch connected to the VTEP to anchor virtual links (our MACVLAN interfaces) onto. This makes it seem like our MACVLAN interfaces are directly connected to the VTEP (meaning traffic from a MACVLAN interface looks exactly like traffic from a distinct physical device attached to the wire). Note that the interfaces are viewable by issuing `ifconfig` in the Docker container.
-#### High Level Overview
-The script performs the following logic to simulate a migration:
-1. An endpoint (e.g., `dummy1` with IP `192.168.0.19`) is created on `host1`.
-2. `host1` sends traffic. `vtep1` learns the MAC/IP and advertises it via BGP EVPN to the fabric.
-3. The script executes `ip link delete dummy1` on `host1`.
-4. The endpoint effectively disappears from the original location.
-5. The script executes `ip link add link vtepbond name dummy1 type macvlan mode bridge` on `host2`.
-6. It assigns the exact same MAC and IP (`192.168.0.19`) to this new interface.
-7. The interface is brought up
-9. As soon as the migrated interfaces sends a message, `vtep2` will send a BGP RA to the spine.
-10. The spine will then advertise that information to the rest of the network.
-11. Other VTEPs receive the update and switch their routing path from `vtep1` to `vtep2`.
+Instead of moving physical hosts, we use Linux MACVLAN interfaces to represent endpoints. Each host node has a bonded uplink (`vtepbond`) connecting it to its VTEP. MACVLAN interfaces are created on top of this bond, so every MACVLAN looks like a distinct physical device directly attached to the VTEP's bridge.
+
+#### How a single migration works
+To move a VM from one VTEP to another the script:
+1. Creates a new MACVLAN interface on the destination host with the same name, MAC, and IP.
+2. Waits briefly (default 0.2s) so the MAC address exists on both old and new hosts simultaneously.
+3. Deletes the MACVLAN from the source host.
+
+The destination VTEP learns the MAC/IP and advertises it via BGP EVPN. Other VTEPs receive the update and re-route traffic to the new location.
+
+#### Random Movement
+The simulation runs for a fixed wall-clock duration (default 60s). Each second every VM independently rolls against `VM_MOVE_PROBABILITY` (default 0.1). All VMs that "win" the roll in a given tick are migrated together in bulk. Destinations are created, one overlap sleep is performed for the whole group, then all sources are deleted. This keeps tick duration roughly constant regardless of how many VMs move, so doubling the VM count produces proportionally more total migrations within the same time window.
+
 ### Quick Start
 This section assumes you have already completed the FRR Workspace Setup Guide from the Notion wiki and already have the FRR container running.
 1. Change into the test directory: 
@@ -65,15 +65,20 @@ Here are some results from our experiments! All message counts were obtained by 
 
 #### 64 Robots
 Running the test for 120 seconds with 64 robots and a 33% (0.33) chance of movement probability results in these numbers on the `spine1` node:
-* 62    `MP_UNREACH_NLRI` packets.
-* 1414  `MP_REACH_NLRI` packets.
+* 67    `MP_UNREACH_NLRI` packets.
+* 1089  `MP_REACH_NLRI` packets.
 
 #### 128 Robots
 Running the test for 120 seconds with 128 robots and a 33% (0.33) chance of movement probability results in these numbers on the `spine1` node:
-* 97    `MP_UNREACH_NLRI` packets.
-* 1813  `MP_REACH_NLRI` packets.
+* 170    `MP_UNREACH_NLRI` packets.
+* 1869  `MP_REACH_NLRI` packets.
 
 #### 252 Robots
 Running the test for 120 seconds with 252 robots and a 33% (0.33) chance of movement probability results in these numbers on the `spine1` node:
-* 114   `MP_UNREACH_NLRI` packets.
-* 2281  `MP_REACH_NLRI` packets.
+* 211    `MP_UNREACH_NLRI` packets.
+* 2727   `MP_REACH_NLRI` packets.
+
+##### Analysis
+When doubling the number of robots from 64 to 128 we see an increase of 153% in `MP_REACH_NLRI` packets and 71% in `MP_UNREACH_NLRI` packet. When doubling again to 252 we see a 45% increase in `MP_REACH_NLRI` packets. However, we only see a 24% increase in `MP_UNREACH_NLRI`.
+<br>
+Note that we did not actually double the robots in the last test, simply because our test cannot handle 256 robots due to how our IP address assigning is implemented.
