@@ -150,16 +150,34 @@ VM IPs follow the scheme `192.168.100.{vm_index}/16`. MACs are deterministic: `0
 
 Key constants in `test_evpn_capstone_asym.py` (most can be overridden via environment variables):
 
-| Constant | Default | Meaning |
-|----------|---------|---------|
-| `NUM_MOBILE_VMS` | `30` | Total mobile VM endpoints created |
-| `CONTROLLER_VTEPS` | `{"vtep1"}` | Hub VTEPs; controller endpoint lives here |
-| `MIGRATION_BATCH_SIZE` | `5` | VMs moved per batch |
-| `MIGRATION_REPEAT_COUNT` | `3` | Full migration rounds |
-| `MIGRATION_BATCH_SETTLE_SECONDS` | `0.5` | Pause between batches |
-| `MOBILITY_OVERLAP_SECONDS` | `0.2` | Duplicate-MAC overlap window per VM |
+| Constant | Default | Env var | Meaning |
+|----------|---------|---------|----------|
+| `NUM_MOBILE_VMS` | `30` | `NUM_MOBILE_VMS` | Total mobile VM endpoints created |
+| `CONTROLLER_VTEPS` | `{"vtep1"}` | — | Hub VTEPs; controller endpoint lives here |
+| `MOBILITY_OVERLAP_SECONDS` | `0.2` | `MOBILITY_OVERLAP_SECONDS` | Duplicate-MAC overlap window (per batch, not per VM) |
+| `MOBILITY_OVERLAP_ENABLED` | `True` | `MOBILITY_OVERLAP_ENABLED` | Set to `0` to skip the overlap sleep entirely |
+| `SIMULATION_DURATION_SECONDS` | `60` | `SIMULATION_DURATION_SECONDS` | Total time-based simulation runtime |
+| `SIMULATION_TICK_SECONDS` | `1.0` | `SIMULATION_TICK_SECONDS` | Interval between movement evaluation ticks |
+| `VM_MOVE_PROBABILITY` | `0.1` | `VM_MOVE_PROBABILITY` | Per-tick probability that any single VM will move (0.0–1.0) |
+| `BATCH_SHELL_COMMANDS` | `True` | `BATCH_SHELL_COMMANDS` | When `1`, group ip-link operations per host into single shell calls |
+| `SIMULATION_SEED` | random | `SIMULATION_SEED` | RNG seed for reproducibility; logged at the start of each run |
+| `SWEEP_VM_COUNTS` | `5,10,20,40,80` | `SWEEP_VM_COUNTS` | Comma-separated VM counts for `test_mobility_scaling_sweep` |
 
-After every migration round a non-asserting spot-check runs three ping scenarios. See §9 for full details of what those pings test and why they behave unexpectedly.
+### Movement model
+
+The simulation uses **deadline-based tick scheduling**: each tick targets a
+wall-clock deadline computed as `sim_start + tick_number * SIMULATION_TICK_SECONDS`.
+After completing migration work the loop sleeps only the remaining time until the
+next deadline. If work exceeds the tick interval a warning is logged and the loop
+proceeds immediately. This ensures the effective move rate scales with
+`NUM_MOBILE_VMS` rather than being throttled by per-tick work duration.
+
+Destination VTEPs are chosen **uniformly at random** from all mobility-eligible
+VTEPs other than the VM's current location (rather than deterministic round-robin).
+
+After the simulation completes, a non-asserting connectivity spot-check calls
+`verify_post_migration_connectivity()` (from `debug_tools.py`). See §9 for
+details of what those pings test and why they may behave unexpectedly.
 
 ---
 
@@ -265,7 +283,9 @@ Do not combine with `advertise-default-gw`.
 
 ### The three ping checks
 
-`run_post_mobility_controller_spotcheck` runs after each migration round. The pings are informational — they print `SUCCESS` / `FAILED` but do not assert and cannot fail the test.
+`verify_post_migration_connectivity()` (in `debug_tools.py`) runs after each
+simulation. The check is wrapped in a try/except so it is informational — it
+prints results but does not fail the test.
 
 | # | Source | Destination | Expected result under hub-spoke policy |
 |---|--------|-------------|----------------------------------------|
@@ -483,16 +503,16 @@ From `test_evpn_capstone_asym.py`:
 - `CONTROLLER_VTEPS = {"vtep1"}` (hub/controller side is fixed)
 - `NUM_MOBILE_VMS = 30`
 - migration behavior is controlled by:
-  - `MIGRATION_BATCH_SIZE` (default `5`)
-  - `MIGRATION_REPEAT_COUNT` (default `3`)
-  - `MIGRATION_BATCH_SETTLE_SECONDS` (default `0.5`)
+  - `SIMULATION_DURATION_SECONDS` (default `60`)
+  - `SIMULATION_TICK_SECONDS` (default `1.0`)
+  - `VM_MOVE_PROBABILITY` (default `0.1`)
   - `MOBILITY_OVERLAP_SECONDS` (default `0.2`)
-- an always-on post-mobility informational spot-check runs after migration:
-  - controller -> 3 deterministic-random VM IPs
-  - one VM on VTEP2 -> controller endpoint
-  - same VTEP2 VM -> 2 VM IPs on one VTEP3+
-
-These spot-check pings print `SUCCESS` / `FAILED` and do not assert/fail the test.
+  - `MOBILITY_OVERLAP_ENABLED` (default `True`)
+  - `BATCH_SHELL_COMMANDS` (default `True`)
+  - `SIMULATION_SEED` (random; logged for reproducibility)
+- a non-asserting post-simulation connectivity spot-check runs via
+  `verify_post_migration_connectivity()` from `debug_tools.py`.
+  It prints results but does not fail the test.
 
 ## 10) Fast troubleshooting checklist
 
