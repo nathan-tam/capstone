@@ -40,6 +40,7 @@ To filter for BGP Update packets (remember, Withdraw messages are part of Update
 
 ### The Visualizer
 The visualizer runs as a Flask server inside the FRR container and is viewed from your host browser.
+<br>
 💡Important: you will need to stop and re-build the container again with port mapping enabled. A simple container restart is not enough to add new published ports. Here's a quick guide:
 1. Stop and remove the existing container with `docker rm docker rm -f $(whoami)-$(basename /bin/pwd)-frr-ubuntu22`
 2. Follow the FRRouting Workspace Setup guide on Notion until the `docker run` command (which is basically the second step)
@@ -54,7 +55,7 @@ $(whoami)-$(basename /bin/pwd)-frr-ubuntu22:latest bash
 ```
 4. Continue following the setup guide normally.
 #### Running the Web Server
-There are a few ways you can use to run the server in the background, this instructions use `tmux`.
+There are a few methods to run the server in the background, these instructions use `tmux`.
 First, install some Python dependencies:
 ```command
 pip3 install flask flask-socketio requests
@@ -63,10 +64,9 @@ Start a `tmux` session:
 ```command
 tmux new -s server
 ```
-Navigate to `~/frr/tests/topotest/bgp_evpn_capstone_asym/
-And run the server:
+Navigate to `~/frr/tests/topotest/bgp_evpn_capstone_asym/` and run the server:
 ```command
 python3 visualizer_server.py
 ```
-Open `http://localhost:5000` on your host machine.
+Open `http://localhost:5000` on your host machine. If this doesn't immediately work, RESTART YOUR CONTAINER. It's probable that your port mapping is messed up and restart will quickly fix it.
 Detach from the `tmux` session and run the Topotest. The visualizer will display the topology and endpoint movement events in real time.
