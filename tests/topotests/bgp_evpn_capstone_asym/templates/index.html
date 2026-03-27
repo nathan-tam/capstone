@@ -36,80 +36,73 @@
 
     <!-- client-side logic for creating graph objects and processing live events -->
     <script>
-        // DataSet storing all topology nodes (spines, VTEPs, hosts, VMs).
         var nodes = new vis.DataSet([]);
-
-        // DataSet storing links between devices (for example, host-to-vtep and vm-to-host).
         var edges = new vis.DataSet([]);
-
-        // reference to the DOM element where the graph will be rendered.
         var container = document.getElementById('mynetwork');
-        
-        // vis-network expects a data object containing node and edge datasets.
+
         var data = { nodes: nodes, edges: edges };
 
-        // graph behavior and styling options.
+        // 1. Enable Hierarchical Layout and tune the physics
         var options = {
-            // enable force-directed physics so nodes spread out naturally.
-            physics: {
-                // use ForceAtlas2-based solver for readable topology spacing.
-                solver: 'forceAtlas2Based',
-
-                // physics tuning values controlling attraction/repulsion and link stiffness.
-                forceAtlas2Based: { gravitationalConstant: -100, centralGravity: 0.01, springLength: 200, springConstant: 0.08 }
+            layout: {
+                hierarchical: {
+                    enabled: true,
+                    direction: 'UD',          // Up-Down pyramid
+                    sortMethod: 'directed',   // Respect the levels we assign
+                    nodeSpacing: 150,         // Horizontal space between nodes
+                    levelSeparation: 150      // Vertical space between layers
+                }
             },
-
-            // default node shape and text appearance.
+            physics: {
+                solver: 'hierarchicalRepulsion',
+                hierarchicalRepulsion: {
+                    nodeDistance: 150,
+                    springConstant: 0.05,
+                    damping: 0.09
+                }
+            },
             nodes: { shape: 'dot', font: { color: '#ffffff' }, borderWidth: 2 },
-
-            // default edge thickness and smoothing.
-            edges: { width: 2, smooth: { type: 'continuous' } }
+            // Use curved vertical lines for a cleaner diagram look
+            edges: { width: 2, smooth: { type: 'cubicBezier', forceDirection: 'vertical', roundness: 0.4 } }
         };
-
-        // create the live network visualization instance.
         var network = new vis.Network(container, data, options);
 
-        // connect to the same host/port serving this page using Socket.IO.
         var socket = io.connect('http://' + document.domain + ':' + location.port);
 
-        // listen for backend-emitted topology events.
         socket.on('network_event', function(msg) {
-            // handle node-addition events.
             if (msg.action === 'ADD_NODE') {
-                // prevent duplicate nodes if the same event is sent more than once.
                 if (!nodes.get(msg.id)) {
-                    // choose node color based on topology role.
-                    let color = msg.type === 'spine' ? '#ff4d4d' : 
-                                msg.type === 'vtep' ? '#4da6ff' : 
-                                msg.type === 'host' ? '#4dff4d' : '#ffff4d'; // VM
-
-                    // make VM nodes smaller than infrastructure nodes for visual distinction.
-                    let size = msg.type === 'vm' ? 12 : 25;
-
-                    // add the node to the graph with label, color, and size.
-                    nodes.add({id: msg.id, label: msg.id, color: {background: color, border: '#ffffff'}, size: size});
+                    let color, size, level;
+                    
+                    // 2. Explicitly assign levels to enforce the hierarchy
+                    if (msg.type === 'spine') { 
+                        color = '#ff4d4d'; size = 25; level = 0; 
+                    } else if (msg.type === 'vtep') { 
+                        color = '#4da6ff'; size = 25; level = 1; 
+                    } else if (msg.type === 'host') { 
+                        color = '#4dff4d'; size = 25; level = 2; 
+                    } else { 
+                        color = '#ffff4d'; size = 12; level = 3; // VM
+                    }
+                    
+                    nodes.add({
+                        id: msg.id, 
+                        label: msg.id, 
+                        color: {background: color, border: '#ffffff'}, 
+                        size: size,
+                        level: level 
+                    });
                 }
             } 
-            // handle link creation between two existing nodes.
             else if (msg.action === 'ADD_LINK') {
-                // generate stable edge ID from source and target names.
                 let edgeId = msg.source + '-' + msg.target;
-
-                // prevent duplicate links on repeated events.
                 if (!edges.get(edgeId)) {
-                    // color VM attachment links yellow; other topology links gray.
                     let color = msg.source.startsWith('vm') ? '#ffff4d' : '#888888';
-
-                    // add the edge connecting source and target nodes.
                     edges.add({id: edgeId, from: msg.source, to: msg.target, color: {color: color}});
                 }
             }
-            // handle link deletion when an endpoint is detached/moved.
             else if (msg.action === 'DEL_LINK') {
-                // rebuild the same deterministic edge ID used for insertion.
                 let edgeId = msg.source + '-' + msg.target;
-
-                // remove the edge only if it currently exists.
                 if (edges.get(edgeId)) edges.remove(edgeId);
             }
         });
