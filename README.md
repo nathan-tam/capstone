@@ -37,3 +37,36 @@ Note that every time you run the test it will overwrite the previous `.pcap` fil
 To filter for BGP Update packets (remember, Withdraw messages are part of Update messages) we can use the following Wireshark filters to find what we're looking for:
 * `bgp.type == 2` will show all BGP Update messages captured.
 * `bgp.update.path_attribute.type_code == 15` will show all BGP messages that contain `MP_UNREACH_NLRI`, useful for double checking numbers. Type code 14 will show messages with `MP_REACH_NLRI`.
+
+### The Visualizer
+The visualizer runs as a Flask server inside the FRR container and is viewed from your host browser.
+💡Important: you will need to stop and re-build the container again with port mapping enabled. A simple container restart is not enough to add new published ports. Here's a quick guide:
+1. Stop and remove the existing container with `docker rm docker rm -f $(whoami)-$(basename /bin/pwd)-frr-ubuntu22`
+2. Follow the FRRouting Workspace Setup guide on Notion until the `docker run` command (which is basically the second step)
+3. Run this modified version of the command:
+```command
+docker run --init -it --privileged \
+-p 5000:5000 \
+--name $(whoami)-$(basename /bin/pwd)-frr-ubuntu22 \
+-v /lib/modules:/lib/modules \
+-v $(pwd):/home/frr/frr \
+$(whoami)-$(basename /bin/pwd)-frr-ubuntu22:latest bash
+```
+4. Continue following the setup guide normally.
+#### Running the Web Server
+There are a few ways you can use to run the server in the background, this instructions use `tmux`.
+First, install some Python dependencies:
+```command
+pip3 install flask flask-socketio requests
+```
+Start a `tmux` session:
+```command
+tmux new -s server
+```
+Navigate to `~/frr/tests/topotest/bgp_evpn_capstone_asym/
+And run the server:
+```command
+python3 visualizer_server.py
+```
+Open `http://localhost:5000` on your host machine.
+Detach from the `tmux` session and run the Topotest. The visualizer will display the topology and endpoint movement events in real time.

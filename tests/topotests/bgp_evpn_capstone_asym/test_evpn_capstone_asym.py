@@ -18,6 +18,19 @@ import random
 from time import sleep
 import platform
 import pytest
+import requests
+
+VISUALIZER_URL = "http://127.0.0.1:5000/event"
+
+def send_vis_event(action, **kwargs):
+    """Safely send events to the visualizer server."""
+    try:
+        payload = {"action": action}
+        payload.update(kwargs)
+        # Ultra-short timeout so the test doesn't slow down if the server is off
+        requests.post(VISUALIZER_URL, json=payload, timeout=0.05)
+    except Exception:
+        pass
 
 # Save the Current Working Directory to find configuration files.
 CWD = os.path.dirname(os.path.realpath(__file__))
@@ -455,6 +468,8 @@ def build_topo(tgen):
     # Create spines
     spine1 = tgen.add_router("spine1")
     spine2 = tgen.add_router("spine2")
+    send_vis_event("ADD_NODE", id="spine1", type="spine")   # added for visualizer
+    send_vis_event("ADD_NODE", id="spine2", type="spine")   # added for visualizer
 
     # Create VTEPs
     vteps = []
@@ -462,12 +477,15 @@ def build_topo(tgen):
         vtep_name = f"vtep{i}"
         vtep = tgen.add_router(vtep_name)
         vteps.append(vtep_name)
+        send_vis_event("ADD_NODE", id=vtep_name, type="vtep")   # added for visualizer
         
         # Connect this VTEP to spine1.
         tgen.add_link(spine1, vtep)
+        send_vis_event("ADD_LINK", source="spine1", target=vtep_name) # added for visualizer
         
         # Connect this VTEP to spine2.
         tgen.add_link(spine2, vtep)
+        send_vis_event("ADD_LINK", source="spine2", target=vtep_name) # added for visualizer
 
     # Create hosts and distribute them across VTEPs.
     hosts = []
@@ -475,6 +493,7 @@ def build_topo(tgen):
         host_name = f"host{i}"
         host = tgen.add_router(host_name)
         hosts.append(host_name)
+        send_vis_event("ADD_NODE", id=host_name, type="host")  # added for visualizer
         
         # Distribute hosts across VTEPs in round-robin fashion.
         vtep_idx = (i - 1) % NUM_VTEPS
@@ -483,6 +502,7 @@ def build_topo(tgen):
         
         # Connect the selected VTEP to this host.
         tgen.add_link(vtep, host)
+        send_vis_event("ADD_LINK", source=vtep_name, target=host_name)
 
 
 @pytest.fixture(scope="module")
@@ -569,13 +589,21 @@ def create_macvlan_endpoint(tgen, host_name, vm_name, ip, mac):
         f"failed to bring up {vm_name} on {host_name}",
     )
 
+    # VISUALIZER HOOK: Add VM node (if it doesn't exist) and link it to the host
+    send_vis_event("ADD_NODE", id=vm_name, type="vm")
+    send_vis_event("ADD_LINK", source=vm_name, target=host_name)
+
 
 def delete_macvlan_endpoint(tgen, host_name, vm_name):
     """Delete one MACVLAN endpoint from a host namespace."""
     host = tgen.gears[host_name]
     print(f"Deleting MACVLAN {vm_name} from {host_name}")
+
     result = host.run(f"ip link del {vm_name} >/dev/null 2>&1 && echo ok || echo failed").strip()
     assert result == "ok", f"failed to delete MACVLAN {vm_name} from {host_name}"
+
+    # VISUALIZER HOOK: Remove the link between the VM and the old host
+    send_vis_event("DEL_LINK", source=vm_name, target=host_name)
 
 
 def create_controller_endpoint(tgen):
