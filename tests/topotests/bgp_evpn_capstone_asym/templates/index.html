@@ -42,25 +42,265 @@
 
         var data = { nodes: nodes, edges: edges };
 
-        // 1. Enable Hierarchical Layout and tune the physics
+        // Keep placement deterministic so mobility events do not re-layout the entire graph.
+        var LEVEL_Y = {
+            spine: 90,
+            vtep: 260,
+            host: 440,
+            vm: 610
+        };
+
+        var SPACING_X = {
+            spine: 420,
+            vtep: 220,
+            host: 220,
+            vm: 90
+        };
+
+        var vmCurrentHost = new Map();
+        var hostToVms = new Map();
+        var vmAnimations = new Map();
+        var nodeTypeById = new Map();
+        var typeToNodeIds = {
+            spine: [],
+            vtep: [],
+            host: []
+        };
+
+        var ANIMATION_MIN_MS = 260;
+        var ANIMATION_MAX_MS = 900;
+        var ANIMATION_MS_PER_PIXEL = 0.42;
+
+        function parseOrdinal(id, prefix) {
+            if (!id.startsWith(prefix)) {
+                return 1;
+            }
+            var suffix = id.slice(prefix.length);
+            var value = parseInt(suffix, 10);
+            return Number.isFinite(value) ? value : 1;
+        }
+
+        function isVmLikeNode(id) {
+            var nodeType = nodeTypeById.get(id);
+            return nodeType === 'vm' || id.startsWith('vm') || id === 'controller';
+        }
+
+        function easeInOutCubic(t) {
+            return t < 0.5
+                ? 4 * t * t * t
+                : 1 - Math.pow(-2 * t + 2, 3) / 2;
+        }
+
+        function getSpineCenterX() {
+            var spines = typeToNodeIds.spine;
+            if (!spines.length) {
+                return 0;
+            }
+            var totalX = 0;
+            spines.forEach(function(id) {
+                var node = nodes.get(id);
+                totalX += (node && typeof node.x === 'number') ? node.x : 0;
+            });
+            return totalX / spines.length;
+        }
+
+        function relayoutTypeRow(type) {
+            var ids = typeToNodeIds[type] || [];
+            if (!ids.length) {
+                return;
+            }
+
+            var spacing = SPACING_X[type];
+            var centerX = (type === 'spine') ? 0 : getSpineCenterX();
+            var startX = centerX - ((ids.length - 1) * spacing) / 2;
+            var rowY = LEVEL_Y[type];
+
+            ids.forEach(function(id, index) {
+                setFixedPosition(id, startX + (index * spacing), rowY, false);
+            });
+        }
+
+        function registerStaticNode(id, type) {
+            if (!typeToNodeIds[type]) {
+                return;
+            }
+            if (typeToNodeIds[type].includes(id)) {
+                return;
+            }
+
+            typeToNodeIds[type].push(id);
+            typeToNodeIds[type].sort(function(a, b) {
+                var prefix = (type === 'spine') ? 'spine' : type;
+                return parseOrdinal(a, prefix) - parseOrdinal(b, prefix);
+            });
+
+            relayoutTypeRow(type);
+
+            // Keep dependent rows centered under the spine row.
+            if (type === 'spine') {
+                relayoutTypeRow('vtep');
+                relayoutTypeRow('host');
+            }
+        }
+
+        function animateNodeTo(id, targetX, targetY, options) {
+            var node = nodes.get(id);
+            if (!node) {
+                return;
+            }
+
+            var opts = options || {};
+
+            var startX = (typeof node.x === 'number') ? node.x : targetX;
+            var startY = (typeof node.y === 'number') ? node.y : targetY;
+            var dx = targetX - startX;
+            var dy = targetY - startY;
+            var distance = Math.hypot(dx, dy);
+            var durationMs = Math.min(
+                ANIMATION_MAX_MS,
+                Math.max(ANIMATION_MIN_MS, distance * ANIMATION_MS_PER_PIXEL)
+            );
+
+            if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) {
+                nodes.update({ id: id, x: targetX, y: targetY, fixed: { x: true, y: true }, physics: false });
+                return;
+            }
+
+            var existing = vmAnimations.get(id);
+            if (existing) {
+                cancelAnimationFrame(existing);
+            }
+
+            var started = performance.now();
+
+            function step(now) {
+                var elapsed = now - started;
+                var t = Math.min(1, elapsed / durationMs);
+                var x;
+                var y;
+
+                if (opts.preferHorizontal) {
+                    // Most of the timeline is horizontal travel; vertical settle happens near the end.
+                    var horizontalPhase = 0.72;
+                    var tx = Math.min(1, t / horizontalPhase);
+                    var ty = t <= horizontalPhase ? 0 : (t - horizontalPhase) / (1 - horizontalPhase);
+                    var lift = opts.liftPx || 14;
+
+                    x = startX + dx * easeInOutCubic(tx);
+                    y = startY + dy * easeInOutCubic(ty) - (lift * Math.sin(Math.PI * tx));
+                } else {
+                    var eased = easeInOutCubic(t);
+                    x = startX + dx * eased;
+                    y = startY + dy * eased;
+                }
+
+                nodes.update({
+                    id: id,
+                    x: x,
+                    y: y,
+                    fixed: { x: true, y: true },
+                    physics: false
+                });
+
+                if (t < 1) {
+                    vmAnimations.set(id, requestAnimationFrame(step));
+                } else {
+                    vmAnimations.delete(id);
+                }
+            }
+
+            vmAnimations.set(id, requestAnimationFrame(step));
+        }
+
+        function setFixedPosition(id, x, y, animate, animationOptions) {
+            if (animate) {
+                animateNodeTo(id, x, y, animationOptions);
+                return;
+            }
+            nodes.update({ id: id, x: x, y: y, fixed: { x: true, y: true }, physics: false });
+        }
+
+        function registerVmOnHost(vmId, hostId) {
+            var oldHost = vmCurrentHost.get(vmId);
+            if (oldHost === hostId) {
+                return;
+            }
+
+            var shouldAnimateMove = Boolean(oldHost);
+
+            if (oldHost) {
+                var oldList = hostToVms.get(oldHost) || [];
+                hostToVms.set(
+                    oldHost,
+                    oldList.filter(function(item) { return item !== vmId; })
+                );
+                relayoutHostVms(oldHost);
+            }
+
+            var newList = hostToVms.get(hostId) || [];
+            if (!newList.includes(vmId)) {
+                newList.push(vmId);
+                newList.sort(function(a, b) {
+                    var ordDiff = parseOrdinal(a, 'vm') - parseOrdinal(b, 'vm');
+                    if (ordDiff !== 0) {
+                        return ordDiff;
+                    }
+                    return a.localeCompare(b);
+                });
+            }
+            hostToVms.set(hostId, newList);
+            vmCurrentHost.set(vmId, hostId);
+            relayoutHostVms(hostId, vmId, shouldAnimateMove);
+        }
+
+        function unregisterVmFromHost(vmId, hostId) {
+            var mappedHost = vmCurrentHost.get(vmId);
+            if (mappedHost !== hostId) {
+                return;
+            }
+
+            var vmList = hostToVms.get(hostId) || [];
+            hostToVms.set(
+                hostId,
+                vmList.filter(function(item) { return item !== vmId; })
+            );
+            vmCurrentHost.delete(vmId);
+            relayoutHostVms(hostId);
+        }
+
+        function relayoutHostVms(hostId, movedVmId, animateMovedVm) {
+            var hostNode = nodes.get(hostId);
+            if (!hostNode) {
+                return;
+            }
+
+            var vmList = hostToVms.get(hostId) || [];
+            if (!vmList.length) {
+                return;
+            }
+
+            // Compute a compact host-local grid so many VMs can fit without overlap.
+            var cols = Math.max(2, Math.ceil(Math.sqrt(vmList.length)));
+            var rowSpacing = 70;
+            var colSpacing = SPACING_X.vm;
+            var centerOffset = (cols - 1) / 2;
+
+            vmList.forEach(function(vmId, index) {
+                var row = Math.floor(index / cols);
+                var col = index % cols;
+                var x = hostNode.x + (col - centerOffset) * colSpacing;
+                var y = LEVEL_Y.vm + row * rowSpacing;
+                var shouldAnimate = animateMovedVm && vmId === movedVmId;
+                setFixedPosition(vmId, x, y, shouldAnimate, {
+                    preferHorizontal: true,
+                    liftPx: 14
+                });
+            });
+        }
+
+        // Use deterministic coordinates and disable runtime physics to avoid jitter.
         var options = {
-            layout: {
-                hierarchical: {
-                    enabled: true,
-                    direction: 'UD',          // Up-Down pyramid
-                    sortMethod: 'directed',   // Respect the levels we assign
-                    nodeSpacing: 150,         // Horizontal space between nodes
-                    levelSeparation: 150      // Vertical space between layers
-                }
-            },
-            physics: {
-                solver: 'hierarchicalRepulsion',
-                hierarchicalRepulsion: {
-                    nodeDistance: 150,
-                    springConstant: 0.05,
-                    damping: 0.09
-                }
-            },
+            physics: false,
             nodes: { shape: 'dot', font: { color: '#ffffff' }, borderWidth: 2 },
             // Use curved vertical lines for a cleaner diagram look
             edges: { width: 2, smooth: { type: 'cubicBezier', forceDirection: 'vertical', roundness: 0.4 } }
@@ -72,17 +312,30 @@
         socket.on('network_event', function(msg) {
             if (msg.action === 'ADD_NODE') {
                 if (!nodes.get(msg.id)) {
-                    let color, size, level;
+                    let color, size, x, y;
                     
-                    // 2. Explicitly assign levels to enforce the hierarchy
+                    // Assign deterministic coordinates by topology role.
                     if (msg.type === 'spine') { 
-                        color = '#ff4d4d'; size = 25; level = 0; 
+                        color = '#ff4d4d';
+                        size = 25;
+                        x = 0;
+                        y = LEVEL_Y.spine;
                     } else if (msg.type === 'vtep') { 
-                        color = '#4da6ff'; size = 25; level = 1; 
+                        color = '#4da6ff';
+                        size = 25;
+                        x = 0;
+                        y = LEVEL_Y.vtep;
                     } else if (msg.type === 'host') { 
-                        color = '#4dff4d'; size = 25; level = 2; 
+                        color = '#4dff4d';
+                        size = 25;
+                        x = 0;
+                        y = LEVEL_Y.host;
                     } else { 
-                        color = '#ffff4d'; size = 12; level = 3; // VM
+                        color = '#ffff4d';
+                        size = 12;
+                        // VMs are re-positioned when linked to a host.
+                        x = 0;
+                        y = LEVEL_Y.vm;
                     }
                     
                     nodes.add({
@@ -90,20 +343,35 @@
                         label: msg.id, 
                         color: {background: color, border: '#ffffff'}, 
                         size: size,
-                        level: level 
+                        x: x,
+                        y: y,
+                        fixed: { x: true, y: true },
+                        physics: false
                     });
+                    nodeTypeById.set(msg.id, msg.type);
+                    if (msg.type === 'spine' || msg.type === 'vtep' || msg.type === 'host') {
+                        registerStaticNode(msg.id, msg.type);
+                    }
                 }
             } 
             else if (msg.action === 'ADD_LINK') {
                 let edgeId = msg.source + '-' + msg.target;
                 if (!edges.get(edgeId)) {
-                    let color = msg.source.startsWith('vm') ? '#ffff4d' : '#888888';
+                    let color = isVmLikeNode(msg.source) ? '#ffff4d' : '#888888';
                     edges.add({id: edgeId, from: msg.source, to: msg.target, color: {color: color}});
+                }
+
+                if (isVmLikeNode(msg.source) && msg.target.startsWith('host')) {
+                    registerVmOnHost(msg.source, msg.target);
                 }
             }
             else if (msg.action === 'DEL_LINK') {
                 let edgeId = msg.source + '-' + msg.target;
                 if (edges.get(edgeId)) edges.remove(edgeId);
+
+                if (isVmLikeNode(msg.source) && msg.target.startsWith('host')) {
+                    unregisterVmFromHost(msg.source, msg.target);
+                }
             }
         });
     </script>
