@@ -61,15 +61,23 @@
         var hostToVms = new Map();
         var vmAnimations = new Map();
         var nodeTypeById = new Map();
+        var hostVmSlots = new Map();
         var typeToNodeIds = {
             spine: [],
             vtep: [],
             host: []
         };
 
-        var ANIMATION_MIN_MS = 260;
-        var ANIMATION_MAX_MS = 900;
-        var ANIMATION_MS_PER_PIXEL = 0.42;
+        var ANIMATION_MIN_MS = 320;
+        var ANIMATION_MAX_MS = 1200;
+        var ANIMATION_MS_PER_PIXEL = 0.55;
+        var HORIZONTAL_TRAVEL_PHASE = 0.82;
+        var BASE_MOVE_LIFT_PX = 22;
+        var MAX_DYNAMIC_LIFT_PX = 40;
+        var HOST_VM_GRID_COLUMNS = 3;
+        var HOST_VM_GRID_ROWS = 2;
+        var HOST_VM_COL_SPACING = 68;
+        var HOST_VM_ROW_SPACING = 70;
 
         function parseOrdinal(id, prefix) {
             if (!id.startsWith(prefix)) {
@@ -181,10 +189,12 @@
 
                 if (opts.preferHorizontal) {
                     // Most of the timeline is horizontal travel; vertical settle happens near the end.
-                    var horizontalPhase = 0.72;
+                    var horizontalPhase = HORIZONTAL_TRAVEL_PHASE;
                     var tx = Math.min(1, t / horizontalPhase);
                     var ty = t <= horizontalPhase ? 0 : (t - horizontalPhase) / (1 - horizontalPhase);
-                    var lift = opts.liftPx || 14;
+                    var requestedLift = opts.liftPx || BASE_MOVE_LIFT_PX;
+                    var dynamicLift = requestedLift + Math.min(16, Math.abs(dx) * 0.06);
+                    var lift = Math.min(MAX_DYNAMIC_LIFT_PX, dynamicLift);
 
                     x = startX + dx * easeInOutCubic(tx);
                     y = startY + dy * easeInOutCubic(ty) - (lift * Math.sin(Math.PI * tx));
@@ -220,6 +230,64 @@
             nodes.update({ id: id, x: x, y: y, fixed: { x: true, y: true }, physics: false });
         }
 
+        function getOrCreateHostSlotMap(hostId) {
+            if (!hostVmSlots.has(hostId)) {
+                hostVmSlots.set(hostId, new Map());
+            }
+            return hostVmSlots.get(hostId);
+        }
+
+        function assignStableSlot(hostId, vmId) {
+            var slots = getOrCreateHostSlotMap(hostId);
+            if (slots.has(vmId)) {
+                return slots.get(vmId);
+            }
+
+            var used = new Set(slots.values());
+            var slot = 0;
+            while (used.has(slot)) {
+                slot += 1;
+            }
+            slots.set(vmId, slot);
+            return slot;
+        }
+
+        function releaseStableSlot(hostId, vmId) {
+            var slots = hostVmSlots.get(hostId);
+            if (!slots) {
+                return;
+            }
+            slots.delete(vmId);
+        }
+
+        function pruneStaleSlots(hostId, vmList) {
+            var slots = hostVmSlots.get(hostId);
+            if (!slots) {
+                return;
+            }
+
+            var live = new Set(vmList);
+            Array.from(slots.keys()).forEach(function(vmId) {
+                if (!live.has(vmId)) {
+                    slots.delete(vmId);
+                }
+            });
+        }
+
+        function hostVmPositionFromSlot(hostNode, slot) {
+            var cols = HOST_VM_GRID_COLUMNS;
+            var row = Math.floor(slot / cols);
+            if (row >= HOST_VM_GRID_ROWS) {
+                // Overflow fallback: keep any excess on the last configured row.
+                row = HOST_VM_GRID_ROWS - 1;
+            }
+            var col = slot % cols;
+            var centerOffset = (cols - 1) / 2;
+            var x = hostNode.x + (col - centerOffset) * HOST_VM_COL_SPACING;
+            var y = LEVEL_Y.vm + row * HOST_VM_ROW_SPACING;
+            return { x: x, y: y };
+        }
+
         function registerVmOnHost(vmId, hostId) {
             var oldHost = vmCurrentHost.get(vmId);
             if (oldHost === hostId) {
@@ -234,6 +302,7 @@
                     oldHost,
                     oldList.filter(function(item) { return item !== vmId; })
                 );
+                releaseStableSlot(oldHost, vmId);
                 relayoutHostVms(oldHost);
             }
 
@@ -250,6 +319,7 @@
             }
             hostToVms.set(hostId, newList);
             vmCurrentHost.set(vmId, hostId);
+            assignStableSlot(hostId, vmId);
             relayoutHostVms(hostId, vmId, shouldAnimateMove);
         }
 
@@ -265,6 +335,7 @@
                 vmList.filter(function(item) { return item !== vmId; })
             );
             vmCurrentHost.delete(vmId);
+            releaseStableSlot(hostId, vmId);
             relayoutHostVms(hostId);
         }
 
@@ -279,21 +350,15 @@
                 return;
             }
 
-            // Compute a compact host-local grid so many VMs can fit without overlap.
-            var cols = Math.max(2, Math.ceil(Math.sqrt(vmList.length)));
-            var rowSpacing = 70;
-            var colSpacing = SPACING_X.vm;
-            var centerOffset = (cols - 1) / 2;
+            pruneStaleSlots(hostId, vmList);
 
-            vmList.forEach(function(vmId, index) {
-                var row = Math.floor(index / cols);
-                var col = index % cols;
-                var x = hostNode.x + (col - centerOffset) * colSpacing;
-                var y = LEVEL_Y.vm + row * rowSpacing;
+            vmList.forEach(function(vmId) {
+                var slot = assignStableSlot(hostId, vmId);
+                var pos = hostVmPositionFromSlot(hostNode, slot);
                 var shouldAnimate = animateMovedVm && vmId === movedVmId;
-                setFixedPosition(vmId, x, y, shouldAnimate, {
+                setFixedPosition(vmId, pos.x, pos.y, shouldAnimate, {
                     preferHorizontal: true,
-                    liftPx: 14
+                    liftPx: BASE_MOVE_LIFT_PX
                 });
             });
         }
