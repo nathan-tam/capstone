@@ -73,8 +73,8 @@ Navigate to `~/frr/tests/topotest/bgp_evpn_capstone_asym/` and run the server:
 ```command
 python3 visualizer_server.py
 ```
-Open `http://localhost:5000` on your host machine. If this doesn't immediately work, RESTART YOUR CONTAINER. It's probable that your port mapping is messed up and a restart will quickly fix it.
-Detach from the `tmux` session and run the Topotest. The visualizer will display the topology and endpoint movement events in real time.
+Open `http://localhost:5000` on your host machine. If this doesn't immediately work, RESTART YOUR CONTAINER. It's probable that your port mapping is messed up and a restart will quickly fix it.<br>
+Detach from the `tmux` session and run the Topotest. The visualizer will display the topology and endpoint movement events in real time.<br>
 IMPORTANT: If you are on a Mac, this probably won't work. This is because port 5000 is likely already used for AirPlay Receiver. You can turn this off by going to Settings > General > AirDrop and Handoff and toggling off AirPlay Receiver.
 ### Live Packet Graph
 The asymmetrical mobility test includes a standalone live packet chart page that is separate from the topology view. During the test run, packet totals from active captures are sampled and streamed to this chart. This feature is largely frivolous, and does not represent anything interesting.
