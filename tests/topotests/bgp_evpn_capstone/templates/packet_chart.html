@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>EVPN Packet Live Chart</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        :root {
+            --bg: #091018;
+            --panel: #111d2a;
+            --panel-border: #243649;
+            --text: #e6f2ff;
+            --muted: #a8c1da;
+            --accent: #39d0ff;
+        }
+
+        * { box-sizing: border-box; }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            color: var(--text);
+            font-family: "Avenir Next", "Segoe UI", sans-serif;
+            background:
+                radial-gradient(1000px 500px at 90% -10%, #17324f 0%, transparent 70%),
+                radial-gradient(900px 500px at -10% 100%, #12263f 0%, transparent 70%),
+                var(--bg);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 22px;
+        }
+
+        .shell {
+            width: min(1100px, 100%);
+            background: rgba(17, 29, 42, 0.92);
+            border: 1px solid var(--panel-border);
+            border-radius: 16px;
+            box-shadow: 0 24px 64px rgba(0, 0, 0, 0.45);
+            overflow: hidden;
+        }
+
+        .header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            padding: 14px 18px;
+            border-bottom: 1px solid var(--panel-border);
+            background: linear-gradient(100deg, rgba(16, 29, 43, 0.9), rgba(20, 41, 63, 0.85));
+        }
+
+        .title {
+            margin: 0;
+            font-size: 1.05rem;
+            letter-spacing: 0.02em;
+        }
+
+        .meta {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            color: var(--muted);
+            font-size: 0.86rem;
+            white-space: nowrap;
+        }
+
+        .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #22c55e;
+            box-shadow: 0 0 10px rgba(34, 197, 94, 0.75);
+        }
+
+        .main {
+            padding: 14px 16px 12px;
+        }
+
+        .chart-wrap {
+            height: min(70vh, 560px);
+        }
+
+        .stats {
+            margin: 12px 0 2px;
+            color: var(--muted);
+            font-size: 0.88rem;
+            display: grid;
+            grid-template-columns: repeat(3, minmax(160px, 1fr));
+            gap: 10px;
+        }
+
+        .stat {
+            border: 1px solid var(--panel-border);
+            border-radius: 10px;
+            padding: 8px 10px;
+            background: rgba(9, 16, 24, 0.8);
+        }
+
+        .stat strong {
+            color: var(--text);
+            font-size: 0.98rem;
+            margin-left: 6px;
+        }
+
+        @media (max-width: 780px) {
+            .header {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+
+            .stats {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="shell">
+        <div class="header">
+            <h1 class="title">EVPN Mobility Packet Rate Monitor</h1>
+            <div class="meta">
+                <span class="dot"></span>
+                <span id="statusText">Waiting for samples...</span>
+            </div>
+        </div>
+
+        <div class="main">
+            <div class="chart-wrap">
+                <canvas id="packetChart"></canvas>
+            </div>
+            <div class="stats">
+                <div class="stat">Latest Total<strong id="latestTotal">0</strong></div>
+                <div class="stat">Latest Delta<strong id="latestDelta">0</strong></div>
+                <div class="stat">Samples<strong id="sampleCount">0</strong></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        var socket = io.connect('http://' + document.domain + ':' + location.port);
+        var labels = [];
+        var totalSeries = [];
+        var deltaSeries = [];
+        var maxPoints = 120;
+
+        var ctx = document.getElementById('packetChart').getContext('2d');
+        var chart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: labels,
+                datasets: [
+                    {
+                        label: 'Total Packets (across active captures)',
+                        data: totalSeries,
+                        borderColor: '#39d0ff',
+                        backgroundColor: 'rgba(57, 208, 255, 0.18)',
+                        borderWidth: 2,
+                        pointRadius: 0,
+                        fill: true,
+                        tension: 0.24
+                    },
+                    {
+                        label: 'Packets Added Since Last Sample',
+                        data: deltaSeries,
+                        borderColor: '#ffd166',
+                        borderWidth: 2,
+                        pointRadius: 0,
+                        fill: false,
+                        tension: 0.2
+                    }
+                ]
+            },
+            options: {
+                maintainAspectRatio: false,
+                animation: false,
+                interaction: { mode: 'index', intersect: false },
+                plugins: {
+                    legend: {
+                        labels: {
+                            color: '#d2e5f8',
+                            boxWidth: 22
+                        }
+                    }
+                },
+                scales: {
+                    x: {
+                        ticks: {
+                            color: '#a8c1da',
+                            maxTicksLimit: 10
+                        },
+                        grid: { color: 'rgba(80, 120, 160, 0.18)' }
+                    },
+                    y: {
+                        beginAtZero: true,
+                        ticks: { color: '#a8c1da' },
+                        grid: { color: 'rgba(80, 120, 160, 0.18)' }
+                    }
+                }
+            }
+        });
+
+        function pushPacketSample(msg) {
+            var total = Number(msg.total_packets || 0);
+            var delta = Number(msg.delta_packets || 0);
+            var stamp = msg.ts || new Date().toLocaleTimeString();
+
+            labels.push(stamp);
+            totalSeries.push(total);
+            deltaSeries.push(delta);
+
+            if (labels.length > maxPoints) {
+                labels.shift();
+                totalSeries.shift();
+                deltaSeries.shift();
+            }
+
+            chart.update('none');
+
+            document.getElementById('statusText').textContent = 'Live updates active';
+            document.getElementById('latestTotal').textContent = String(total);
+            document.getElementById('latestDelta').textContent = String(delta);
+            document.getElementById('sampleCount').textContent = String(labels.length);
+        }
+
+        function resetSeries() {
+            labels.length = 0;
+            totalSeries.length = 0;
+            deltaSeries.length = 0;
+            chart.update('none');
+            document.getElementById('statusText').textContent = 'Waiting for samples...';
+            document.getElementById('latestTotal').textContent = '0';
+            document.getElementById('latestDelta').textContent = '0';
+            document.getElementById('sampleCount').textContent = '0';
+        }
+
+        socket.on('network_event', function(msg) {
+            if (!msg) {
+                return;
+            }
+            if (msg.action === 'PACKET_SAMPLE_RESET') {
+                resetSeries();
+                return;
+            }
+            if (msg.action !== 'PACKET_SAMPLE') {
+                return;
+            }
+            pushPacketSample(msg);
+        });
+    </script>
+</body>
+</html>
