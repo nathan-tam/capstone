@@ -1,6 +1,6 @@
 # Simulating Host Mobility in Topotest with FRRouting
 This documentation details the methodology used to simulate Host Mobility in an EVPN/VXLAN fabric using FRRouting Topotests. It also serves as some basic guidance for running experiments and analysing results. There is a `LISEZMOI.md` file is each tests' respective directory that contains more in-depth information on how the tests function behind the scenes. Those test directories would be:
-* ` /tests/topotests/bgp_evpn_capstone/`
+* `/tests/topotests/bgp_evpn_capstone/`
 * `/tests/topotests/bgp_evpn_capstone_asym/`
 ### Overview
 "Host Mobility" usually refers to a host migrating from one Access Point to another while retaining its MAC and IP address. The network fabric (EVPN) must detect this move and update its routing tables to send traffic to the new location.<br>
@@ -43,13 +43,13 @@ Some quick Wireshark BGP Update filtering tips:
 ### The Visualizer
 The visualizer runs as a Flask server inside the FRR container and is viewed from your host browser.
 <br>
-Important: you will need to stop and re-build the container again with port mapping enabled. A simple container restart is not enough to add new published ports. Here's a quick guide:
+Important: you will need to have launched your Docker container with the `docker run` command that contains the `-p 5000:5000` line. Otherwise, you will need to stop and re-build the container again with port mapping enabled. A simple container restart is not enough to add new published ports (to my knowledge). Here's a quick guide:
 1. Stop and remove the existing container with
 ```command
 docker rm docker rm -f $(whoami)-$(basename /bin/pwd)-frr-ubuntu22
 ```
 2. Follow the FRRouting Workspace Setup guide on Notion until the `docker run` command (which is basically the second step)
-3. Run this modified version of the command:
+3. Run the 'full' version of the command:
 ```command
 docker run --init -it --privileged \
 -p 5000:5000 \
@@ -58,7 +58,7 @@ docker run --init -it --privileged \
 -v $(pwd):/home/frr/frr \
 $(whoami)-$(basename /bin/pwd)-frr-ubuntu22:latest bash
 ```
-4. Continue following the setup guide normally.
+4. Continue following the setup guide normally. Remember to reinstall `tcpdump` and other tools (like `tmux`) afterwards!
 #### Running the Web Server
 There are a few methods to run the server in the background, these instructions use `tmux`.
 First, install some Python dependencies:
