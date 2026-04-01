@@ -32,6 +32,18 @@ def index():
     # render templates/index.html and return it as the HTTP response
     return render_template('index.html')
 
+
+@app.route('/packet-chart')
+def packet_chart():
+    """Serve the standalone live packet chart page."""
+    return render_template('packet_chart.html')
+
+
+@app.route('/health')
+def health():
+    """Basic liveness endpoint used by optional test-side startup checks."""
+    return {"status": "ok"}, 200
+
 # HTTP POST /event is called by the Topotest file to push (send) new events
 @app.route('/event', methods=['POST'])
 def receive_event():

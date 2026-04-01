@@ -70,3 +70,34 @@ python3 visualizer_server.py
 ```
 Open `http://localhost:5000` on your host machine. If this doesn't immediately work, RESTART YOUR CONTAINER. It's probable that your port mapping is messed up and a restart will quickly fix it.
 Detach from the `tmux` session and run the Topotest. The visualizer will display the topology and endpoint movement events in real time.
+
+### Live Packet Graph
+The asymmetrical mobility test includes a standalone live packet chart page that is separate from the topology view. During the test run, packet totals from active captures are sampled and streamed to this chart.
+
+#### Launching the Chart Companion
+1. Ensure the visualizer server is running (same server process used for the topology UI):
+```command
+python3 tests/topotests/bgp_evpn_capstone_asym/visualizer_server.py
+```
+2. Run the asymmetrical test normally:
+```command
+sudo -E pytest -s tests/topotests/bgp_evpn_capstone_asym/test_evpn_capstone_asym.py
+```
+3. The chart companion opens automatically in a new browser window/tab at:
+`http://127.0.0.1:5000/packet-chart`
+
+#### Optional Environment Flags
+You can tune chart behavior with these environment variables before running the test:
+* `ENABLE_LIVE_PACKET_GRAPH=true|false` enables/disables packet sampling events.
+* `AUTO_OPEN_PACKET_CHART_WINDOW=true|false` enables/disables automatic browser pop-up.
+* `AUTO_START_PACKET_CHART_SERVER=true|false` auto-starts `visualizer_server.py` if port 5000 is not already serving.
+* `PACKET_SAMPLE_INTERVAL_SECONDS=<float>` controls sampling interval (default `1.0`, minimum `0.2`).
+* `PACKET_CHART_URL=<url>` overrides the chart URL (default `/packet-chart`).
+
+Example:
+```command
+ENABLE_LIVE_PACKET_GRAPH=true \
+AUTO_OPEN_PACKET_CHART_WINDOW=true \
+PACKET_SAMPLE_INTERVAL_SECONDS=0.75 \
+sudo -E pytest -s tests/topotests/bgp_evpn_capstone_asym/test_evpn_capstone_asym.py
+```

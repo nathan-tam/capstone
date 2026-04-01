@@ -19,6 +19,33 @@
 
         /* floating info card in the top-left corner that stays above the network canvas. */
         #overlay { position: absolute; top: 10px; left: 10px; z-index: 10; background: rgba(0,0,0,0.7); padding: 15px; border-radius: 8px; border: 1px solid #333;}
+
+        /* packet animation layer drawn above network and below control overlay. */
+        #packet-layer { position: absolute; inset: 0; z-index: 6; pointer-events: none; overflow: hidden; }
+
+        .packet-dot {
+            position: absolute;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            opacity: 0.95;
+            transform: translate(-50%, -50%);
+            box-shadow: 0 0 10px rgba(255, 255, 255, 0.55);
+        }
+
+        .packet-dot.reach { background: #39d353; }
+        .packet-dot.unreach { background: #ff5a66; }
+
+        #packet-controls {
+            margin-top: 10px;
+            padding-top: 10px;
+            border-top: 1px solid #333;
+            font-size: 13px;
+            line-height: 1.6;
+        }
+
+        .toggle-row { display: flex; align-items: center; gap: 8px; }
+        .toggle-row input { accent-color: #4da6ff; }
     </style>
 </head>
 <body>
@@ -29,16 +56,26 @@
 
         <!-- quick visual key for graph node categories. -->
         <p>🔴 Spine <br>🔵 VTEP <br>🟢 Host <br>🟡 VM (Mobile)</p>
+
+        <div id="packet-controls">
+            <strong>Packet Overlay</strong>
+            <div class="toggle-row"><input type="checkbox" id="toggle-reach" checked><label for="toggle-reach">Show REACH</label></div>
+            <div class="toggle-row"><input type="checkbox" id="toggle-unreach" checked><label for="toggle-unreach">Show UNREACH</label></div>
+        </div>
     </div>
 
     <!-- container element where vis-network renders the topology graph -->
     <div id="mynetwork"></div>
+    <div id="packet-layer"></div>
 
     <!-- client-side logic for creating graph objects and processing live events -->
     <script>
         var nodes = new vis.DataSet([]);
         var edges = new vis.DataSet([]);
         var container = document.getElementById('mynetwork');
+        var packetLayer = document.getElementById('packet-layer');
+        var toggleReach = document.getElementById('toggle-reach');
+        var toggleUnreach = document.getElementById('toggle-unreach');
 
         var data = { nodes: nodes, edges: edges };
 
@@ -78,6 +115,8 @@
         var HOST_VM_GRID_ROWS = 2;
         var HOST_VM_COL_SPACING = 68;
         var HOST_VM_ROW_SPACING = 70;
+        var MAX_ACTIVE_PACKET_DOTS = 180;
+        var activePacketDots = [];
 
         function parseOrdinal(id, prefix) {
             if (!id.startsWith(prefix)) {
@@ -228,6 +267,88 @@
                 return;
             }
             nodes.update({ id: id, x: x, y: y, fixed: { x: true, y: true }, physics: false });
+        }
+
+        function showPacketType(packetType) {
+            var normalized = String(packetType || '').toUpperCase();
+            if (normalized === 'REACH') {
+                return toggleReach.checked;
+            }
+            if (normalized === 'UNREACH') {
+                return toggleUnreach.checked;
+            }
+            return true;
+        }
+
+        function packetStyleClass(packetType) {
+            return String(packetType || '').toUpperCase() === 'UNREACH' ? 'unreach' : 'reach';
+        }
+
+        function getNodeDomPoint(nodeId) {
+            var node = nodes.get(nodeId);
+            if (!node || typeof node.x !== 'number' || typeof node.y !== 'number') {
+                return null;
+            }
+            return network.canvasToDOM({ x: node.x, y: node.y });
+        }
+
+        function prunePacketDotsIfNeeded() {
+            while (activePacketDots.length > MAX_ACTIVE_PACKET_DOTS) {
+                var el = activePacketDots.shift();
+                if (el && el.parentNode) {
+                    el.parentNode.removeChild(el);
+                }
+            }
+        }
+
+        function animatePacketFlow(packetType, source, target, vmName) {
+            if (!showPacketType(packetType)) {
+                return;
+            }
+
+            var sourcePoint = getNodeDomPoint(source);
+            var targetPoint = getNodeDomPoint(target);
+            if (!sourcePoint || !targetPoint) {
+                return;
+            }
+
+            var dot = document.createElement('div');
+            dot.className = 'packet-dot ' + packetStyleClass(packetType);
+            dot.title = (packetType || 'PACKET') + ' ' + (vmName || '') + ' ' + source + ' -> ' + target;
+            packetLayer.appendChild(dot);
+            activePacketDots.push(dot);
+            prunePacketDotsIfNeeded();
+
+            var dx = targetPoint.x - sourcePoint.x;
+            var dy = targetPoint.y - sourcePoint.y;
+            var distance = Math.hypot(dx, dy);
+            var durationMs = Math.max(260, Math.min(1000, distance * 1.4));
+            var start = performance.now();
+
+            function frame(now) {
+                var t = Math.min(1, (now - start) / durationMs);
+                var eased = easeInOutCubic(t);
+                var x = sourcePoint.x + dx * eased;
+                var y = sourcePoint.y + dy * eased;
+
+                dot.style.left = x + 'px';
+                dot.style.top = y + 'px';
+                dot.style.opacity = String(0.95 - (0.45 * t));
+
+                if (t < 1) {
+                    requestAnimationFrame(frame);
+                } else {
+                    if (dot.parentNode) {
+                        dot.parentNode.removeChild(dot);
+                    }
+                    var idx = activePacketDots.indexOf(dot);
+                    if (idx >= 0) {
+                        activePacketDots.splice(idx, 1);
+                    }
+                }
+            }
+
+            requestAnimationFrame(frame);
         }
 
         function getOrCreateHostSlotMap(hostId) {
@@ -437,6 +558,9 @@
                 if (isVmLikeNode(msg.source) && msg.target.startsWith('host')) {
                     unregisterVmFromHost(msg.source, msg.target);
                 }
+            }
+            else if (msg.action === 'PACKET_FLOW') {
+                animatePacketFlow(msg.packet_type, msg.source, msg.target, msg.vm);
             }
         });
     </script>
