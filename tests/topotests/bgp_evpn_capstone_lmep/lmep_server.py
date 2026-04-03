@@ -1,32 +1,54 @@
 #!/usr/bin/env python3
-"""Standalone LMEP mapping server and VXLAN forwarder.
+"""Standalone LMEP mapping server with binary TLV registration and Scapy forwarding.
 
 This process is intended to run outside the topotest process so the test can
-interact with it as an external service. It exposes:
-- a control port for MAC registration updates
-- a data port for controller-facing frame forwarding requests
+interact with it as an external service.  It exposes:
 
-The implementation is intentionally small and uses only the Python standard
-library so it can be started from tmux or any other shell session.
+- a UDP registration port that accepts binary TLV MAC registration messages
+- a Scapy-based packet sniffer that intercepts controller-facing Ethernet
+  frames, resolves the destination MAC via the mapping table, and encapsulates
+  the frame in VXLAN toward the correct VTEP
+
+The registration protocol uses the custom TLV format defined in the
+LMEP Standard (see ``LMEP Standard.md``):
+
+    Type 0x01 (6 bytes)  - Client MAC
+    Type 0x02 (4 bytes)  - Client IP
+    Type 0x03 (3 bytes)  - VNI
+    Type 0x04 (4 bytes)  - VTEP IP
+
+Usage::
+
+    python3 lmep_server.py --port 6000 --iface eth0
 """
 
 from __future__ import annotations
 
 import argparse
-import base64
-import json
 import logging
 import socket
 import struct
 import threading
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
+from scapy.all import IP, UDP, Ether, Raw, sendp, sniff
 
-VXLAN_FLAGS_I = 0x08000000
-DEFAULT_VXLAN_PORT = 4789
+# ---------------------------------------------------------------------------
+# TLV type constants (must match test_evpn_capstone_lmep.py)
+# ---------------------------------------------------------------------------
+MAC_REGISTER_TYPE = 0x01
+CLIENT_IP_TYPE = 0x02
+VNI_TYPE = 0x03
+VTEP_IP_TYPE = 0x04
+
+VXLAN_UDP_PORT = 4789
 
 
+# ---------------------------------------------------------------------------
+# Data store
+# ---------------------------------------------------------------------------
 @dataclass
 class LMEPEntry:
     mac: str
@@ -47,6 +69,8 @@ class LMEPEntry:
 
 @dataclass
 class LMEPStore:
+    """Thread-safe MAC-to-VTEP mapping store."""
+
     entries: Dict[str, LMEPEntry] = field(default_factory=dict)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -79,181 +103,170 @@ class LMEPStore:
             return {mac: entry.as_dict() for mac, entry in self.entries.items()}
 
 
-def mac_to_bytes(mac: str) -> bytes:
-    return bytes.fromhex(mac.replace(":", ""))
+# ---------------------------------------------------------------------------
+# Binary TLV registration parser
+# ---------------------------------------------------------------------------
+def parse_tlv_registration(data: bytes) -> dict:
+    """Parse a binary TLV registration packet into a dict.
+
+    Returns a dict with keys: ``mac``, ``client_ip``, ``vni``, ``vtep_ip``.
+    Missing fields will be ``None``.
+    """
+    result: dict = {"mac": None, "client_ip": None, "vni": None, "vtep_ip": None}
+    offset = 0
+
+    while offset < len(data):
+        if offset + 2 > len(data):
+            break
+        tlv_type = data[offset]
+        tlv_length = data[offset + 1]
+        if offset + 2 + tlv_length > len(data):
+            break
+        tlv_value = data[offset + 2 : offset + 2 + tlv_length]
+
+        if tlv_type == MAC_REGISTER_TYPE and tlv_length == 6:
+            result["mac"] = ":".join(f"{b:02x}" for b in tlv_value)
+        elif tlv_type == CLIENT_IP_TYPE and tlv_length == 4:
+            result["client_ip"] = socket.inet_ntoa(tlv_value)
+        elif tlv_type == VNI_TYPE and tlv_length == 3:
+            result["vni"] = int.from_bytes(tlv_value, "big")
+        elif tlv_type == VTEP_IP_TYPE and tlv_length == 4:
+            result["vtep_ip"] = socket.inet_ntoa(tlv_value)
+
+        offset += 2 + tlv_length
+
+    return result
 
 
-def normalize_ethertype(value) -> int:
-    if value is None:
-        return 0x0800
-    if isinstance(value, int):
-        return value
-    text = str(value).strip().lower()
-    if text.startswith("0x"):
-        return int(text, 16)
-    return int(text, 16) if any(ch in text for ch in "abcdef") else int(text)
-
-
-def build_ethernet_frame(dst_mac: str, src_mac: str, payload: bytes, ethertype=0x0800) -> bytes:
-    return struct.pack(
-        "!6s6sH",
-        mac_to_bytes(dst_mac),
-        mac_to_bytes(src_mac),
-        normalize_ethertype(ethertype),
-    ) + payload
-
-
-def build_vxlan_packet(vni: int, inner_frame: bytes) -> bytes:
-    # VXLAN header: 8 bytes total, I flag set and VNI in the upper 24 bits of the
-    # second 32-bit word.
-    return struct.pack("!I", VXLAN_FLAGS_I) + struct.pack("!I", int(vni) << 8) + inner_frame
-
-
-def send_vxlan_packet(outer_src_ip: Optional[str], outer_dst_ip: str, vxlan_port: int, packet: bytes) -> int:
+# ---------------------------------------------------------------------------
+# UDP registration listener
+# ---------------------------------------------------------------------------
+def listen_for_registrations(
+    bind_host: str,
+    port: int,
+    store: LMEPStore,
+    stop_event: threading.Event,
+) -> None:
+    """Listen on a UDP socket for binary TLV registration messages."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((bind_host, port))
+    sock.settimeout(1.0)
+    logging.info("Registration listener on udp://%s:%s", bind_host, port)
+
     try:
-        if outer_src_ip:
-            sock.bind((outer_src_ip, 0))
-        return sock.sendto(packet, (outer_dst_ip, vxlan_port))
+        while not stop_event.is_set():
+            try:
+                data, addr = sock.recvfrom(1024)
+            except socket.timeout:
+                continue
+
+            parsed = parse_tlv_registration(data)
+            mac = parsed.get("mac")
+            vtep_ip = parsed.get("vtep_ip")
+
+            if mac and vtep_ip:
+                entry = store.register(
+                    mac=mac,
+                    client_ip=parsed.get("client_ip") or "",
+                    vni=parsed.get("vni") or 1000,
+                    vtep_ip=vtep_ip,
+                )
+                logging.info(
+                    "Registered MAC %s -> VTEP %s (client_ip=%s vni=%s regs=%s) from %s",
+                    entry.mac,
+                    entry.vtep_ip,
+                    entry.client_ip,
+                    entry.vni,
+                    entry.registrations,
+                    addr,
+                )
+            else:
+                logging.warning(
+                    "Invalid registration from %s: parsed=%s raw=%s",
+                    addr,
+                    parsed,
+                    data.hex(),
+                )
     finally:
         sock.close()
 
 
-def send_json_line(conn: socket.socket, payload: dict) -> None:
-    conn.sendall((json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"))
+# ---------------------------------------------------------------------------
+# Scapy-based intercept & forward
+# ---------------------------------------------------------------------------
+def make_forwarder(store: LMEPStore, source_ip: str, vxlan_port: int, iface: str):
+    """Return a Scapy packet callback that translates and forwards via VXLAN."""
+
+    def translate_and_forward(packet):
+        if Ether not in packet:
+            return
+
+        dst_mac = packet[Ether].dst.lower()
+        entry = store.lookup(dst_mac)
+        if entry is None:
+            return
+
+        vni = entry.vni
+        vxlan_header = Raw(
+            b"\x08\x00\x00\x00" + vni.to_bytes(3, "big") + b"\x00"
+        )
+        outer_udp = UDP(sport=12345, dport=vxlan_port)
+        outer_ip = IP(src=source_ip, dst=entry.vtep_ip)
+        outer_eth = Ether(src="00:11:22:33:44:55", dst="ff:ff:ff:ff:ff:ff")
+
+        vxlan_packet = outer_eth / outer_ip / outer_udp / vxlan_header / packet[Ether]
+
+        sendp(vxlan_packet, iface=iface, verbose=False)
+        logging.info(
+            "Forwarded packet dst_mac=%s -> VTEP %s (vni=%s)",
+            dst_mac,
+            entry.vtep_ip,
+            vni,
+        )
+
+    return translate_and_forward
 
 
-def read_json_lines(conn: socket.socket):
-    buffer = b""
-    while True:
-        chunk = conn.recv(4096)
-        if not chunk:
-            break
-        buffer += chunk
-        while b"\n" in buffer:
-            line, buffer = buffer.split(b"\n", 1)
-            line = line.strip()
-            if not line:
-                continue
-            yield json.loads(line.decode("utf-8"))
-
-
-def handle_control_connection(conn: socket.socket, store: LMEPStore) -> None:
-    with conn:
-        for request in read_json_lines(conn):
-            action = request.get("action")
-            if action == "register":
-                logging.info(
-                    "control register mac=%s client_ip=%s vni=%s vtep=%s",
-                    request.get("mac"),
-                    request.get("client_ip", ""),
-                    request.get("vni", 1000),
-                    request.get("vtep_ip"),
-                )
-                entry = store.register(
-                    mac=request["mac"],
-                    client_ip=request.get("client_ip", ""),
-                    vni=int(request.get("vni", 1000)),
-                    vtep_ip=request["vtep_ip"],
-                )
-                send_json_line(conn, {"ok": True, "entry": entry.as_dict()})
-                logging.info(
-                    "control register complete mac=%s registrations=%s resolved_vtep=%s",
-                    entry.mac,
-                    entry.registrations,
-                    entry.vtep_ip,
-                )
-            elif action == "lookup":
-                entry = store.lookup(request["mac"])
-                send_json_line(conn, {"ok": True, "entry": entry.as_dict() if entry else None})
-                logging.info(
-                    "control lookup mac=%s hit=%s",
-                    request.get("mac"),
-                    bool(entry),
-                )
-            elif action == "dump":
-                send_json_line(conn, {"ok": True, "entries": store.snapshot()})
-                logging.info("control dump entries=%s", len(store.entries))
-            else:
-                send_json_line(conn, {"ok": False, "error": f"unsupported action: {action}"})
-                logging.warning("control unsupported action=%s payload=%s", action, request)
-
-
-def handle_data_connection(conn: socket.socket, store: LMEPStore, outer_src_ip: Optional[str], vxlan_port: int) -> None:
-    with conn:
-        for request in read_json_lines(conn):
-            dst_mac = request["dst_mac"]
-            src_mac = request.get("src_mac", "02:00:00:00:00:01")
-            ethertype = request.get("ethertype", 0x0800)
-            vni = int(request.get("vni", 1000))
-            payload_hex = request.get("payload_hex")
-            payload_b64 = request.get("payload_b64")
-            payload_text = request.get("payload_text")
-
-            if payload_hex:
-                payload = bytes.fromhex(payload_hex)
-            elif payload_b64:
-                payload = base64.b64decode(payload_b64)
-            elif payload_text is not None:
-                payload = str(payload_text).encode("utf-8")
-            else:
-                payload = b"LMEP"
-
-            entry = store.lookup(dst_mac)
-            if entry is None:
-                send_json_line(conn, {"ok": False, "error": f"unknown destination MAC {dst_mac}"})
-                logging.warning("data forward miss dst_mac=%s src_mac=%s vni=%s", dst_mac, src_mac, vni)
-                continue
-
-            inner_frame = build_ethernet_frame(dst_mac, src_mac, payload, ethertype=ethertype)
-            vxlan_packet = build_vxlan_packet(vni, inner_frame)
-            bytes_sent = send_vxlan_packet(outer_src_ip, entry.vtep_ip, vxlan_port, vxlan_packet)
-            send_json_line(
-                conn,
-                {
-                    "ok": True,
-                    "mac": entry.mac,
-                    "resolved_vtep": entry.vtep_ip,
-                    "vni": vni,
-                    "bytes_sent": bytes_sent,
-                },
-            )
-            logging.info(
-                "data forward dst_mac=%s src_mac=%s vni=%s resolved_vtep=%s bytes_sent=%s",
-                dst_mac,
-                src_mac,
-                vni,
-                entry.vtep_ip,
-                bytes_sent,
-            )
-
-
-def serve_tcp(bind_host: str, port: int, handler, stop_event: threading.Event, label: str, *handler_args) -> None:
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((bind_host, port))
-    server.listen(16)
-    server.settimeout(1.0)
-    logging.info("%s listening on %s:%s", label, bind_host, port)
-    try:
-        while not stop_event.is_set():
-            try:
-                conn, _ = server.accept()
-            except socket.timeout:
-                continue
-            threading.Thread(target=handler, args=(conn, *handler_args), daemon=True).start()
-    finally:
-        server.close()
-
-
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Standalone LMEP mapping server")
-    parser.add_argument("--bind-host", default="0.0.0.0", help="Address to bind the TCP listeners to")
-    parser.add_argument("--control-port", type=int, default=6000, help="TCP control-plane port")
-    parser.add_argument("--data-port", type=int, default=6001, help="TCP data-plane port")
-    parser.add_argument("--vxlan-port", type=int, default=DEFAULT_VXLAN_PORT, help="VXLAN UDP destination port")
-    parser.add_argument("--outer-src-ip", default="", help="Optional outer source IP for VXLAN UDP packets")
-    parser.add_argument("--log-level", default="INFO", help="Logging level")
+    parser = argparse.ArgumentParser(
+        description="Standalone LMEP mapping server (binary TLV + Scapy)"
+    )
+    parser.add_argument(
+        "--bind-host",
+        default="0.0.0.0",
+        help="Address to bind the UDP registration listener to (default: 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=6000,
+        help="UDP port for binary TLV registrations (default: 6000)",
+    )
+    parser.add_argument(
+        "--iface",
+        default="eth0",
+        help="Network interface for Scapy sniffing and forwarding (default: eth0)",
+    )
+    parser.add_argument(
+        "--vxlan-port",
+        type=int,
+        default=VXLAN_UDP_PORT,
+        help="VXLAN UDP destination port for forwarded packets (default: 4789)",
+    )
+    parser.add_argument(
+        "--source-ip",
+        default="192.168.1.1",
+        help="Outer source IP for VXLAN encapsulated packets (default: 192.168.1.1)",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        help="Logging level (default: INFO)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -264,36 +277,32 @@ def main() -> int:
     store = LMEPStore()
     stop_event = threading.Event()
 
-    control_thread = threading.Thread(
-        target=serve_tcp,
-        args=(args.bind_host, args.control_port, handle_control_connection, stop_event, "control-plane", store),
+    # Start the UDP registration listener in a background thread
+    reg_thread = threading.Thread(
+        target=listen_for_registrations,
+        args=(args.bind_host, args.port, store, stop_event),
         daemon=True,
     )
-    data_thread = threading.Thread(
-        target=serve_tcp,
-        args=(args.bind_host, args.data_port, handle_data_connection, stop_event, "data-plane", store, args.outer_src_ip or None, args.vxlan_port),
-        daemon=True,
-    )
+    reg_thread.start()
 
-    control_thread.start()
-    data_thread.start()
+    forwarder = make_forwarder(store, args.source_ip, args.vxlan_port, args.iface)
 
     logging.info(
-        "LMEP server ready: control=%s:%s data=%s:%s vxlan=%s outer-src-ip=%s",
+        "LMEP server ready: registration=udp://%s:%s iface=%s vxlan_port=%s source_ip=%s",
         args.bind_host,
-        args.control_port,
-        args.bind_host,
-        args.data_port,
+        args.port,
+        args.iface,
         args.vxlan_port,
-        args.outer_src_ip or "auto",
+        args.source_ip,
     )
 
+    # Scapy sniff runs in the main thread (blocking)
     try:
-        control_thread.join()
-        data_thread.join()
+        sniff(iface=args.iface, filter="ip", prn=forwarder, store=False)
     except KeyboardInterrupt:
         stop_event.set()
         logging.info("Stopping LMEP server")
+
     return 0
 
 

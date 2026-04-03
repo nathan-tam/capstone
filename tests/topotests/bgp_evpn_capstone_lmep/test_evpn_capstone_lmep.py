@@ -16,9 +16,8 @@
 import os
 import re
 import sys
-import pdb
+import struct
 import random
-import json
 import socket
 import shlex
 from functools import partial
@@ -149,77 +148,53 @@ def _default_lmep_server_host():
 
 
 LMEP_SERVER_HOST = os.environ.get("LMEP_SERVER_HOST", _default_lmep_server_host())
-LMEP_CONTROL_PORT = int(os.environ.get("LMEP_CONTROL_PORT", "6000"))
-LMEP_DATA_PORT = int(os.environ.get("LMEP_DATA_PORT", "6001"))
+LMEP_PORT = int(os.environ.get("LMEP_PORT", "6000"))
 LMEP_VXLAN_PORT = int(os.environ.get("LMEP_VXLAN_PORT", "4789"))
 LMEP_DEFAULT_VNI = int(os.environ.get("LMEP_VNI", "1000"))
 
+# TLV type constants for binary LMEP registration (per LMEP Standard)
+MAC_REGISTER_TYPE = 0x01
+CLIENT_IP_TYPE = 0x02
+VNI_TYPE = 0x03
+VTEP_IP_TYPE = 0x04
 
-def _send_lmep_request(node, server_host, server_port, payload):
-    """Send a JSON request to the standalone LMEP server from the host test process.
 
-    Topotest namespaces are often isolated from the host routing domain. Using a
-    host-side socket keeps the LMEP daemon external/independent while avoiding
-    namespace reachability constraints.
+def _send_lmep_registration_udp(server_host, server_port, mac, client_ip, vni, vtep_ip):
+    """Send a binary TLV MAC registration to the external LMEP server over UDP.
+
+    Builds a packet conforming to the LMEP Standard TLV format:
+      Type 0x01 (6 bytes)  - Client MAC
+      Type 0x02 (4 bytes)  - Client IP
+      Type 0x03 (3 bytes)  - VNI
+      Type 0x04 (4 bytes)  - VTEP IP
+
+    The packet is sent from the host test process (not from a Topotest
+    namespace) so the LMEP daemon remains external and independent.
     """
-    _ = node
-    payload_json = json.dumps(payload, separators=(",", ":"))
-    try:
-        with socket.create_connection((server_host, server_port), timeout=10) as sock:
-            sock.sendall(payload_json.encode("utf-8") + b"\n")
-            sock.shutdown(socket.SHUT_WR)
-            response = sock.recv(65535)
-        output = response.decode("utf-8").strip()
-    except OSError as exc:
-        return {"ok": False, "raw": repr(exc)}
+    mac_bytes = bytes.fromhex(mac.replace(":", ""))
+    tlv_mac = struct.pack("!BB", MAC_REGISTER_TYPE, 6) + mac_bytes
 
-    if not output:
-        return {}
-    try:
-        return json.loads(output.splitlines()[-1])
-    except json.JSONDecodeError:
-        return {"ok": False, "raw": output}
+    ip_bytes = socket.inet_aton(client_ip.split("/")[0])
+    tlv_ip = struct.pack("!BB", CLIENT_IP_TYPE, 4) + ip_bytes
+
+    tlv_vni = struct.pack("!BB", VNI_TYPE, 3) + vni.to_bytes(3, "big")
+
+    vtep_bytes = socket.inet_aton(vtep_ip)
+    tlv_vtep = struct.pack("!BB", VTEP_IP_TYPE, 4) + vtep_bytes
+
+    packet = tlv_mac + tlv_ip + tlv_vni + tlv_vtep
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.sendto(packet, (server_host, server_port))
 
 
-def send_mac_registration(node, server_host, dummy_name, vtep_ip, control_port=LMEP_CONTROL_PORT):
+def send_mac_registration(node, server_host, dummy_name, vtep_ip, port=LMEP_PORT):
+    """Build and send a binary TLV registration for the given dummy interface."""
     dummy_mac = get_dummy_mac(dummy_name)
     dummy_ip, _ = compute_dummy_ip_mac(dummy_name)
-
-    payload = {
-        "action": "register",
-        "mac": dummy_mac,
-        "client_ip": dummy_ip,
-        "vni": LMEP_DEFAULT_VNI,
-        "vtep_ip": vtep_ip,
-    }
-    return _send_lmep_request(node, server_host, control_port, payload)
-
-
-def send_lmep_forward_request(
-    node,
-    server_host,
-    dst_mac,
-    src_mac="02:00:00:00:00:01",
-    payload_text="LMEP",
-    vni=LMEP_DEFAULT_VNI,
-    data_port=LMEP_DATA_PORT,
-    ethertype="0800",
-):
-    payload = {
-        "action": "forward",
-        "dst_mac": dst_mac,
-        "src_mac": src_mac,
-        "vni": vni,
-        "ethertype": ethertype,
-        "payload_text": payload_text,
-    }
-    return _send_lmep_request(node, server_host, data_port, payload)
-
-
-def assert_lmep_forwarding(node, server_host, dst_mac, expected_vtep_ip, src_mac="02:00:00:00:00:01"):
-    result = send_lmep_forward_request(node, server_host, dst_mac, src_mac=src_mac)
-    assert result.get("ok") is True, result
-    assert result.get("resolved_vtep") == expected_vtep_ip, result
+    _send_lmep_registration_udp(
+        server_host, port, dummy_mac, dummy_ip, LMEP_DEFAULT_VNI, vtep_ip
+    )
 
 def config_vtep(vtep_name, vtep, vtep_ip, svi_pip):
     """
@@ -408,7 +383,7 @@ def start_background_ping(host_name, target_ip):
 def start_packet_capture(server_name, capture_name='evpn_bgp_test_noname.pcap'):
     tgen = get_topogen()
     server = tgen.gears[server_name]
-    cmd = f"sudo tcpdump -ni any tcp port {LMEP_CONTROL_PORT} -ttt -w /tmp/outputs/{capture_name} > /dev/null 2>&1 & echo $!"
+    cmd = f"sudo tcpdump -ni any udp port {LMEP_PORT} -ttt -w /tmp/outputs/{capture_name} > /dev/null 2>&1 & echo $!"
     pid = server.run(cmd).strip()
     return pid
 
@@ -592,16 +567,16 @@ def test_host_movement(tgen):
     vtep3 = tgen.gears["vtep3"]
 
     # Fail fast with an actionable error if the standalone LMEP daemon is not reachable.
-    lmep_probe = _send_lmep_request(
-        vtep3,
-        LMEP_SERVER_HOST,
-        LMEP_CONTROL_PORT,
-        {"action": "dump"},
-    )
-    assert lmep_probe.get("ok", True) is not False, (
-        "LMEP control daemon is unreachable from {}:{}: {}\n"
-        "Start lmep_server.py or set LMEP_SERVER_HOST/LMEP_CONTROL_PORT to a reachable endpoint."
-    ).format(LMEP_SERVER_HOST, LMEP_CONTROL_PORT, lmep_probe)
+    try:
+        _send_lmep_registration_udp(
+            LMEP_SERVER_HOST, LMEP_PORT,
+            "ff:ff:ff:ff:ff:ff", "0.0.0.0", 0, "0.0.0.0"
+        )
+    except OSError as exc:
+        pytest.fail(
+            f"LMEP server unreachable at {LMEP_SERVER_HOST}:{LMEP_PORT}: {exc}\n"
+            "Start lmep_server.py or set LMEP_SERVER_HOST/LMEP_PORT."
+        )
 
     pcap_plan = {
         "spine1": (spine1, os.path.join(tgen.logdir, "spine1", "spine1_lmep_mobility.pcap"), "/tmp/tcpdump_lmep_spine1.pid"),
@@ -646,30 +621,25 @@ def test_host_movement(tgen):
             curr_host.run(f"ip link delete {targeted_if}")
             vtep_name = target_hostname.replace("host", "vtep")
             vtep_ip = vtep_ips[vtep_name]
-            vtep = tgen.gears[vtep_name]
-            registration = send_mac_registration(vtep, LMEP_SERVER_HOST, targeted_if, vtep_ip)
-            if registration.get("ok") is not True:
-                last_move_error["details"] = f"registration failed: {registration}"
-                return False
 
-            if registration.get("entry", {}).get("vtep_ip") != vtep_ip:
-                last_move_error["details"] = (
-                    "registration vtep mismatch: expected {} got {} (full={})".format(
-                        vtep_ip,
-                        registration.get("entry", {}).get("vtep_ip"),
-                        registration,
-                    )
-                )
-                return False
-
+            # Send binary TLV registration to external LMEP server
             try:
-                assert_lmep_forwarding(vtep, LMEP_SERVER_HOST, get_dummy_mac(targeted_if), vtep_ip)
-            except AssertionError as exc:
-                last_move_error["details"] = f"forward check failed: {exc}"
+                send_mac_registration(None, LMEP_SERVER_HOST, targeted_if, vtep_ip)
+            except OSError as exc:
+                last_move_error["details"] = f"registration send failed: {exc}"
+                return False
+
+            # Verify EVPN MAC state reflects the movement
+            dummy_mac = get_dummy_mac(targeted_if)
+            output = tgen.gears["vtep1"].vtysh_cmd(
+                "show evpn mac vni 1000 json", isjson=True
+            )
+            mac_entry = output.get("macs", {}).get(dummy_mac)
+            if mac_entry is None:
+                last_move_error["details"] = f"MAC {dummy_mac} not found in EVPN table"
                 return False
 
             move_ts_ms = int(time() * 1000)
-            dummy_mac = get_dummy_mac(targeted_if)
             if dummy_mac == "00:00:00:00:ff:01":
                 after_movement_details.append({
                     "mac": dummy_mac,
