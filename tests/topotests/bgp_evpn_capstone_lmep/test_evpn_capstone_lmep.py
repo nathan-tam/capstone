@@ -2,25 +2,26 @@
 # -*- coding: utf-8 eval: (blacken-mode 1) -*-
 # SPDX-License-Identifier: ISC
 #
-# <template>.py
+# test_evpn_capstone_lmep.py
 # Part of NetDEF Topology Tests
 #
 # Copyright (c) 2017 by
 # Network Device Education Foundation, Inc. ("NetDEF")
 #
 
-"""
-<template>.py: Test <template>.
+"""Topotest for LMEP: Layer-2 Mapping & Encapsulation Protocol.
+
+Simulates endpoint mobility across a 7-VTEP spine-leaf fabric, with the
+LMEP Mapping Server handling MAC-to-VTEP registration via binary TLV over
+UDP and Scapy-based packet forwarding.
 """
 
 import os
-import re
 import sys
 import struct
 import random
 import socket
 import shlex
-from functools import partial
 from time import sleep, time
 import platform
 import pytest
@@ -36,112 +37,60 @@ from lib import topotest
 from lib.topogen import Topogen, TopoRouter, get_topogen
 from lib.topolog import logger
 
-# TODO: select markers based on daemons used during test
 # pytest module level markers
 pytestmark = [
-    # pytest.mark.babeld,
-    # pytest.mark.bfdd,
     pytest.mark.bgpd,
-    # pytest.mark.eigrpd,
-    # pytest.mark.isisd,
-    # pytest.mark.ldpd,
-    # pytest.mark.nhrpd,
-    # pytest.mark.ospf6d,
-    # pytest.mark.ospfd,
-    # pytest.mark.pathd,
-    # pytest.mark.pbrd,
     pytest.mark.pimd,
-    # pytest.mark.ripd,
-    # pytest.mark.ripngd,
-    # pytest.mark.sharpd,
-    # pytest.mark.staticd,
-    # pytest.mark.vrrpd,
 ]
 
 
-def config_bond(node, bond_name, bond_members, bond_ad_sys_mac, br):
-    """
-    Used to setup bonds on the TORs and hosts for MH
-    """
-    node.run("ip link add dev %s type bond mode 802.3ad" % bond_name)
-    node.run("ip link set dev %s type bond lacp_rate 1" % bond_name)
-    node.run("ip link set dev %s type bond miimon 100" % bond_name)
-    node.run("ip link set dev %s type bond xmit_hash_policy layer3+4" % bond_name)
-    node.run("ip link set dev %s type bond min_links 1" % bond_name)
-    node.run(
-        "ip link set dev %s type bond ad_actor_system %s" % (bond_name, bond_ad_sys_mac)
+#####################################################
+##   Configuration — Scaling Parameters
+#####################################################
+
+NUM_VTEPS = 7
+NUM_HOSTS = 7  # One host per VTEP
+
+try:
+    NUM_MOBILE_VMS = max(1, int(os.getenv("NUM_MOBILE_VMS", "30")))
+except ValueError:
+    NUM_MOBILE_VMS = 30
+
+# Controller VTEPs participate in topology/BGP but are excluded from endpoint mobility.
+CONTROLLER_VTEPS = {"vtep1"}
+CONTROLLER_ENDPOINT_HOST = "host1"
+CONTROLLER_ENDPOINT_IFACE = "controller"
+CONTROLLER_ENDPOINT_IP = "192.168.100.254/16"
+CONTROLLER_ENDPOINT_MAC = "00:aa:bb:dd:00:01"
+
+# Migration tuning — matches bgp_evpn_capstone_asym defaults.
+try:
+    MOBILITY_OVERLAP_SECONDS = max(0.0, float(os.getenv("MOBILITY_OVERLAP_SECONDS", "0.2")))
+except ValueError:
+    MOBILITY_OVERLAP_SECONDS = 0.2
+
+try:
+    MIGRATION_BATCH_SIZE = max(1, int(os.getenv("MIGRATION_BATCH_SIZE", "5")))
+except ValueError:
+    MIGRATION_BATCH_SIZE = 5
+
+try:
+    MIGRATION_REPEAT_COUNT = max(1, int(os.getenv("MIGRATION_REPEAT_COUNT", "5")))
+except ValueError:
+    MIGRATION_REPEAT_COUNT = 5
+
+try:
+    MIGRATION_BATCH_SETTLE_SECONDS = max(
+        0.0,
+        float(os.getenv("MIGRATION_BATCH_SETTLE_SECONDS", "0.6")),
     )
-
-    for bond_member in bond_members:
-        node.run("ip link set dev %s down" % bond_member)
-        node.run("ip link set dev %s master %s" % (bond_member, bond_name))
-        node.run("ip link set dev %s up" % bond_member)
-
-    node.run("ip link set dev %s up" % bond_name)
-
-    # if bridge is specified add the bond as a bridge member
-    if br:
-        node.run(" ip link set dev %s master %s" % (bond_name, br))
-        node.run("/sbin/bridge link set dev %s priority 8" % bond_name)
-        node.run("/sbin/bridge vlan del vid 1 dev %s" % bond_name)
-        node.run("/sbin/bridge vlan del vid 1 untagged pvid dev %s" % bond_name)
-        node.run("/sbin/bridge vlan add vid 1000 dev %s" % bond_name)
-        node.run("/sbin/bridge vlan add vid 1000 untagged pvid dev %s" % bond_name)
+except ValueError:
+    MIGRATION_BATCH_SETTLE_SECONDS = 0.6
 
 
-def config_l2vni(vtep_name, node, svi_ip, vtep_ip):
-    """
-    On torm1x amd torm21,
-    Create a VxLAN device for VNI 1000 and add it to the bridge.
-    VLAN-1000 is mapped to VNI-1000.
-
-    Creates a Linux bridge br1000 tied to VRF vrf500.
-    Assigns VLAN 1000 IP addresses to the bridge (SVI).
-    Creates a VXLAN interface for VNI 1000 tied to the VTEP IP.
-    Adds the VXLAN interface to the bridge.
-    Disables MAC learning on VXLAN (because BGP EVPN handles MAC learning).
-    Configures VLAN 1000 on the VXLAN interface.
-    Brings interfaces up to start forwarding traffic.
-    """
-    # Create a bridge br1000 and assign SVI IP
-    node.run("ip link add br1000 type bridge")
-    # node.run("ip link set br1000 master vrf500")
-    node.run("ip addr add %s/16 dev br1000" % svi_ip)
-    # NOTE TO SELF: Is this the any gateway address for hosts to reach: 
-    node.run("ip addr add 192.168.0.250/16 dev br1000")
-    node.run("/sbin/sysctl net.ipv4.conf.br1000.arp_accept=1")
-
-    node.run(
-        "ip link add vni1000 type vxlan local %s dstport 4789 id 1000 nolearning"
-        % vtep_ip
-    )
-    node.run("ip link set vni1000 master br1000 addrgenmode none")
-    node.run("/sbin/bridge link set dev vni1000 learning off")
-    node.run("ip link set vni1000 up")
-    node.run("ip link set br1000 up")
-
-    node.run("/sbin/bridge vlan del vid 1 dev vni1000")
-    node.run("/sbin/bridge vlan del vid 1 untagged pvid dev vni1000")
-    node.run("/sbin/bridge vlan add vid 1000 dev vni1000")
-    node.run("/sbin/bridge vlan add vid 1000 untagged pvid dev vni1000")
-
-
-vtep_ips = {
-    "vtep1": "10.10.10.10",
-    "vtep2": "20.20.20.20",
-    "vtep3": "30.30.30.30"
-}
-
-svi_ips = {
-    "vtep1": "192.168.0.251",
-    "vtep2": "192.168.0.252",
-    "vtep3": "192.168.0.253"
-}
-
-dummy_to_host_map = {}
-# Change this value to increase/decrease number of dummy hosts created
-# This number of dummy interfaces will be divided among host1, host2, and host3
-number_of_dummy=2
+#####################################################
+##   LMEP Server Configuration
+#####################################################
 
 def _default_lmep_server_host():
     return "127.0.0.1"
@@ -188,55 +137,160 @@ def _send_lmep_registration_udp(server_host, server_port, mac, client_ip, vni, v
         sock.sendto(packet, (server_host, server_port))
 
 
-def send_mac_registration(node, server_host, dummy_name, vtep_ip, port=LMEP_PORT):
-    """Build and send a binary TLV registration for the given dummy interface."""
-    dummy_mac = get_dummy_mac(dummy_name)
-    dummy_ip, _ = compute_dummy_ip_mac(dummy_name)
-    _send_lmep_registration_udp(
-        server_host, port, dummy_mac, dummy_ip, LMEP_DEFAULT_VNI, vtep_ip
+def send_lmep_registration(server_host, mac, client_ip, vni, vtep_ip, port=LMEP_PORT):
+    """Send a binary TLV LMEP registration for a VM endpoint."""
+    _send_lmep_registration_udp(server_host, port, mac, client_ip, vni, vtep_ip)
+
+
+#####################################################
+##   Computed Addressing
+#####################################################
+
+# VTEP loopback IPs: vtep1=10.10.10.10, vtep2=20.20.20.20, ...
+vtep_ips = {
+    f"vtep{i}": f"{i*10}.{i*10}.{i*10}.{i*10}"
+    for i in range(1, NUM_VTEPS + 1)
+}
+
+
+def compute_svi_ip(vtep_index):
+    """Compute the SVI IP for a VTEP."""
+    if vtep_index <= 5:
+        return f"192.168.0.{250 + vtep_index}"
+    return f"192.168.200.{vtep_index - 5}"
+
+
+svi_ips = {
+    f"vtep{i}": compute_svi_ip(i)
+    for i in range(1, NUM_VTEPS + 1)
+}
+
+
+def vtep_name_from_index(vtep_index):
+    return f"vtep{vtep_index}"
+
+
+def host_to_vtep_index(host_index):
+    """Hosts are attached round-robin to VTEPs in build_topo()."""
+    return ((host_index - 1) % NUM_VTEPS) + 1
+
+
+def get_mobility_vtep_indices():
+    """Mobility-eligible VTEPs are all VTEPs not marked as controllers."""
+    return [
+        i
+        for i in range(1, NUM_VTEPS + 1)
+        if vtep_name_from_index(i) not in CONTROLLER_VTEPS
+    ]
+
+
+def get_mobility_host_indices():
+    """Mobility-eligible hosts are attached to mobility-eligible VTEPs."""
+    mobility_vtep_indices = set(get_mobility_vtep_indices())
+    return [
+        host_idx
+        for host_idx in range(1, NUM_HOSTS + 1)
+        if host_to_vtep_index(host_idx) in mobility_vtep_indices
+    ]
+
+
+#####################################################
+##   Network Plumbing Helpers
+#####################################################
+
+def config_bond(node, bond_name, bond_members, bond_ad_sys_mac, br):
+    """Set up Linux bonds on VTEPs and hosts for MH."""
+    node.run("ip link add dev %s type bond mode 802.3ad" % bond_name)
+    node.run("ip link set dev %s type bond lacp_rate 1" % bond_name)
+    node.run("ip link set dev %s type bond miimon 100" % bond_name)
+    node.run("ip link set dev %s type bond xmit_hash_policy layer3+4" % bond_name)
+    node.run("ip link set dev %s type bond min_links 1" % bond_name)
+    node.run(
+        "ip link set dev %s type bond ad_actor_system %s" % (bond_name, bond_ad_sys_mac)
     )
 
-def config_vtep(vtep_name, vtep, vtep_ip, svi_pip):
-    """
-    Create the bond/vxlan-bridge on the TOR which acts as VTEP and EPN-PE
-    """
+    for bond_member in bond_members:
+        node.run("ip link set dev %s down" % bond_member)
+        node.run("ip link set dev %s master %s" % (bond_member, bond_name))
+        node.run("ip link set dev %s up" % bond_member)
 
-    # create l2vni, bridge and associated SVI
-    config_l2vni(vtep_name, vtep, svi_pip, vtep_ip)
+    node.run("ip link set dev %s up" % bond_name)
 
-    # create hostbonds and add them to the bridge
-    vtep_id = vtep_name.split("vtep")[1]
-    sys_mac = "44:38:39:ff:ff:0" + vtep_id
+    if br:
+        node.run(" ip link set dev %s master %s" % (bond_name, br))
+        node.run("/sbin/bridge link set dev %s priority 8" % bond_name)
+        node.run("/sbin/bridge vlan del vid 1 dev %s" % bond_name)
+        node.run("/sbin/bridge vlan del vid 1 untagged pvid dev %s" % bond_name)
+        node.run("/sbin/bridge vlan add vid 1000 dev %s" % bond_name)
+        node.run("/sbin/bridge vlan add vid 1000 untagged pvid dev %s" % bond_name)
+
+
+def config_l2vni(node, svi_ip, vtep_ip):
+    """Configure Linux bridge/VXLAN dataplane for L2VNI 1000 on one VTEP."""
+    node.run("ip link add br1000 type bridge")
+    node.run("ip addr add %s/16 dev br1000" % svi_ip)
+    node.run("ip addr add 192.168.0.250/16 dev br1000")
+    node.run("/sbin/sysctl net.ipv4.conf.br1000.arp_accept=1")
+
+    node.run(
+        "ip link add vni1000 type vxlan local %s dstport 4789 id 1000 nolearning"
+        % vtep_ip
+    )
+    node.run("ip link set vni1000 master br1000 addrgenmode none")
+    node.run("/sbin/bridge link set dev vni1000 learning off")
+    node.run("ip link set vni1000 up")
+    node.run("ip link set br1000 up")
+
+    node.run("/sbin/bridge vlan del vid 1 dev vni1000")
+    node.run("/sbin/bridge vlan del vid 1 untagged pvid dev vni1000")
+    node.run("/sbin/bridge vlan add vid 1000 dev vni1000")
+    node.run("/sbin/bridge vlan add vid 1000 untagged pvid dev vni1000")
+
+
+def config_vtep(vtep_name, vtep, vtep_ip, svi_ip):
+    """Configure host-facing bond plus VXLAN bridge on one EVPN VTEP."""
+    config_l2vni(vtep, svi_ip, vtep_ip)
+
+    vtep_index = int(vtep_name.split("vtep")[1])
+    sys_mac = "44:38:39:ff:{:02x}:{:02x}".format(
+        (vtep_index >> 8) & 0xFF,
+        vtep_index & 0xFF,
+    )
 
     bond_member = vtep_name + "-eth2"
     config_bond(vtep, "hostbond1", [bond_member], sys_mac, "br1000")
+
 
 def config_vteps(tgen, vteps):
     for vtep_name in vteps:
         vtep = tgen.gears[vtep_name]
         config_vtep(vtep_name, vtep, vtep_ips.get(vtep_name), svi_ips.get(vtep_name))
 
+
 def compute_host_ip_mac(host_name):
-    host_id = host_name.split("host")[1]
-    host_ip = "192.168.0.24" + host_id + "/16"
-    host_mac = "00:00:00:00:00:0" + host_id
+    host_id = int(host_name.split("host")[1])
+    if host_id <= 127:
+        fourth_octet = host_id
+        third_octet = 0
+    else:
+        offset = host_id - 128
+        third_octet = 1 + (offset // 254)
+        fourth_octet = 1 + (offset % 254)
+
+    host_ip = f"192.168.{third_octet}.{fourth_octet}/16"
+    host_mac = "00:00:00:{:02x}:{:02x}:{:02x}".format(
+        (host_id >> 16) & 0xFF, (host_id >> 8) & 0xFF, host_id & 0xFF
+    )
     return host_ip, host_mac
 
+
 def config_host(host_name, host):
-    """
-    Create the dual-attached bond on host nodes for MH
-    """
-
-    bond_members = []
-    bond_members.append(host_name + "-eth0")
-
-    # Name of the bonded interface to be created on the host
+    """Configure the host-side bonded uplink used to attach endpoints."""
+    bond_members = [host_name + "-eth0"]
     bond_name = "vtepbond"
     config_bond(host, bond_name, bond_members, "00:00:00:00:00:00", None)
 
     host_ip, host_mac = compute_host_ip_mac(host_name)
-
-    # Assign the computed IP address and MAC address to the bonded interface
     host.run("ip addr add %s dev %s" % (host_ip, bond_name))
     host.run("ip link set dev %s address %s" % (bond_name, host_mac))
 
@@ -246,167 +300,210 @@ def config_hosts(tgen, hosts):
         host = tgen.gears[host_name]
         config_host(host_name, host)
 
-def compute_dummy_ip_mac(dummy_name):
-    dummy_id = dummy_name.split("dummy")[1]
-    # IP calculation: 192.168.(dummy_id // 256).(dummy_id % 256)
-    octet_3 = int(dummy_id) // 256
-    octet_4 = int(dummy_id) % 256
-    dummy_ip = f"192.168.{octet_3}.{octet_4}/16"
 
-    # MAC calculation: keep fixed prefix + last 2 bytes from dummy_id
-    # Using ff as the 5th byte as before, and last byte = dummy_id mod 256
-    # We can also encode dummy_id // 256 as the 4th byte for uniqueness
-    mac_byte_4 = octet_3  # 0-3
-    mac_byte_5 = 0xff     # fixed
-    mac_byte_6 = octet_4  # 0-255
-    dummy_mac = f"00:00:{mac_byte_4:02x}:00:{mac_byte_5:02x}:{mac_byte_6:02x}"
-    return dummy_ip, dummy_mac
+#####################################################
+##   MACVLAN Endpoint Management
+#####################################################
 
-def config_dummy(dummy_name, host):
-    dummy_ip, dummy_mac = compute_dummy_ip_mac(dummy_name)
-
-    # Create macvlan interface on vtepbond
-    host.run(f"ip link add link vtepbond name {dummy_name} type macvlan mode bridge")
-    
-    host.run(f"ip link set dev {dummy_name} address {dummy_mac}")
-    host.run(f"ip addr add {dummy_ip} dev {dummy_name}")
-    host.run(f"ip link set dev {dummy_name} up")
-
-# Function we pass to Topogen to create the topology
-def build_topo(tgen):
-    "Build function"
-
-    # Create spine, leaf, and hosts
-    spine1 = tgen.add_router("spine1")
-    spine2 = tgen.add_router("spine2")
-
-    vtep1 = tgen.add_router("vtep1")
-    vtep2 = tgen.add_router("vtep2")
-    vtep3 = tgen.add_router("vtep3")
-
-    host1 = tgen.add_router("host1")
-    host2 = tgen.add_router("host2")
-    host3 = tgen.add_router("host3")
-
-    # Create a p2p connection between r1 and r2
-    tgen.add_link(spine1, vtep1)
-    tgen.add_link(spine1, vtep2)
-    tgen.add_link(spine1, vtep3)
-
-    tgen.add_link(spine2, vtep1)
-    tgen.add_link(spine2, vtep2)
-    tgen.add_link(spine2, vtep3)
-
-    tgen.add_link(vtep1, host1)
-    tgen.add_link(vtep2, host2)
-    tgen.add_link(vtep3, host3)
-
-
-# New form of setup/teardown using pytest fixture
-@pytest.fixture(scope="module")
-def tgen(request):
-    "Setup/Teardown the environment and provide tgen argument to tests"
-
-    # This function initiates the topology build with Topogen...
-    tgen = Topogen(build_topo, request.module.__name__)
-    tgen.start_topology()
-
-    krel = platform.release()
-    if topotest.version_cmp(krel, "4.19") < 0:
-        tgen.errors = "kernel 4.19 needed for multihoming tests"
-        pytest.skip(tgen.errors)
-
-    vteps = []
-    vteps.append("vtep1")
-    vteps.append("vtep2")
-    vteps.append("vtep3")
-    config_vteps(tgen, vteps)
-
-    hosts = []
-    hosts.append("host1")
-    hosts.append("host2")
-    hosts.append("host3")
-    config_hosts(tgen, hosts)
-
-    for i in range(1,number_of_dummy+1):
-        select_host = "host" + str(((i-1) % 3)+1)
-        # select_host = "host1"  # Forcing all dummies to host1 for easier debugging
-        dummy_to_host_map["dummy" + str(i)] = select_host
-        config_dummy("dummy" + str(i), tgen.gears[select_host] )
-    
-    router_list = tgen.routers()
-    for rname, router in router_list.items():
-        router.load_config(
-            TopoRouter.RD_ZEBRA, os.path.join(CWD, "{}/zebra.conf".format(rname))
-            )
-        router.load_config(
-            TopoRouter.RD_BGP, os.path.join(CWD, "{}/evpn.conf".format(rname))
-            )
-    tgen.start_router()
-
-    # Provide tgen as argument to each test function
-    yield tgen
-
-    # Suppress the memory allocation report that FRR prints on shutdown.
-    # The topotest framework treats any remaining allocations as "memory leaks".
-    # It dumps a verbose table for every daemon on every router.
-    # We redirect sys.stderr temporarily so the output is discarded during topology teardown.
-    original_stderr = sys.stderr
-    sys.stderr = open(os.devnull, "w")
-    try:
-        tgen.stop_topology()
-    finally:
-        sys.stderr.close()
-        sys.stderr = original_stderr
-
-# Fixture that executes before each test
-@pytest.fixture(autouse=True)
-def skip_on_failure(tgen):
-    if tgen.routers_have_failure():
-        pytest.skip("skipped because of previous test failure")
-
-# ===================
-# The tests functions
-# ===================
-def start_background_ping(host_name, target_ip):
-    """
-    Start continuous ping in the background. Returns the PID of the ping.
-    """
-    tgen = get_topogen()
+def create_macvlan_endpoint(tgen, host_name, vm_name, ip, mac):
+    """Create one MACVLAN endpoint on a host namespace."""
     host = tgen.gears[host_name]
-    # -D prints timestamp, very helpful for debugging mobility events.
-    cmd = f"ping -i 0.1 -D {target_ip} > /tmp/outputs/ping_output_{host_name}_to_{target_ip}.log 2>&1 & echo $!"
-    pid = host.run(cmd).strip()
-    return pid
 
+    def run_checked(command, error_message):
+        result = host.run(f"{command} >/dev/null 2>&1 && echo ok || echo failed").strip()
+        assert result == "ok", error_message
 
-def start_packet_capture(server_name, capture_name='evpn_bgp_test_noname.pcap'):
-    tgen = get_topogen()
-    server = tgen.gears[server_name]
-    cmd = f"sudo tcpdump -ni any udp port {LMEP_PORT} -ttt -w /tmp/outputs/{capture_name} > /dev/null 2>&1 & echo $!"
-    pid = server.run(cmd).strip()
-    return pid
-
-
-def start_bgp_capture(node, pcap_file, pid_file):
-    """Start a detached tcpdump capture for BGP control-plane traffic."""
-    node.run(
-        "tcpdump -nni any -s 0 -w {} port 179 2>/dev/null & echo $! > {}".format(
-            shlex.quote(pcap_file),
-            shlex.quote(pid_file),
-        ),
-        stdout=None,
+    run_checked(
+        f"ip link add link vtepbond name {vm_name} type macvlan mode bridge",
+        f"failed to create MACVLAN {vm_name} on {host_name}",
+    )
+    run_checked(
+        f"ip link set dev {vm_name} address {mac}",
+        f"failed to set MAC for {vm_name} on {host_name}",
+    )
+    run_checked(
+        f"ip addr add {ip} dev {vm_name}",
+        f"failed to set IP for {vm_name} on {host_name}",
+    )
+    run_checked(
+        f"ip link set dev {vm_name} up",
+        f"failed to bring up {vm_name} on {host_name}",
     )
 
 
-def stop_bgp_capture(node, pid_file):
-    """Stop a detached tcpdump capture if it is running."""
-    node.run(
-        "if [ -f {0} ]; then kill $(cat {0}) 2>/dev/null || true; fi".format(
-            shlex.quote(pid_file)
+def delete_macvlan_endpoint(tgen, host_name, vm_name):
+    """Delete one MACVLAN endpoint from a host namespace."""
+    host = tgen.gears[host_name]
+    result = host.run(f"ip link del {vm_name} >/dev/null 2>&1 && echo ok || echo failed").strip()
+    assert result == "ok", f"failed to delete MACVLAN {vm_name} from {host_name}"
+
+
+def delete_macvlan_endpoint_if_exists(tgen, host_name, vm_name):
+    """Delete a MACVLAN endpoint if present, ignoring missing-interface cases."""
+    host = tgen.gears[host_name]
+    host.run(f"ip link show {vm_name} >/dev/null 2>&1 && ip link del {vm_name} || true")
+
+
+def macvlan_endpoint_exists(tgen, host_name, vm_name):
+    """Return True when endpoint interface exists on the host."""
+    host = tgen.gears[host_name]
+    result = host.run(
+        "ip link show {0} >/dev/null 2>&1 && echo present || echo missing".format(
+            shlex.quote(vm_name)
         )
+    ).strip()
+    return result == "present"
+
+
+def create_controller_endpoint(tgen):
+    """Create the static controller endpoint on the controller-side host."""
+    delete_macvlan_endpoint_if_exists(
+        tgen,
+        CONTROLLER_ENDPOINT_HOST,
+        CONTROLLER_ENDPOINT_IFACE,
+    )
+    create_macvlan_endpoint(
+        tgen,
+        CONTROLLER_ENDPOINT_HOST,
+        CONTROLLER_ENDPOINT_IFACE,
+        CONTROLLER_ENDPOINT_IP,
+        CONTROLLER_ENDPOINT_MAC,
     )
 
+
+#####################################################
+##   Migration Planning
+#####################################################
+
+def build_vm_migration_plan(vm_idx, vm_locations, mobility_vtep_indices, mobility_host_indices):
+    """Compute source/destination placement and addressing for one VM migration."""
+    vm_name = f"vm{vm_idx}"
+    old_host_idx, old_vtep_idx = vm_locations[vm_name]
+    old_host_name = f"host{old_host_idx}"
+
+    # Destination is the next mobility-eligible VTEP.
+    current_pos = mobility_vtep_indices.index(old_vtep_idx)
+    new_vtep_idx = mobility_vtep_indices[(current_pos + 1) % len(mobility_vtep_indices)]
+
+    # Prefer a different host than source.
+    new_host_idx = None
+    for potential_host in mobility_host_indices:
+        if host_to_vtep_index(potential_host) == new_vtep_idx and potential_host != old_host_idx:
+            new_host_idx = potential_host
+            break
+
+    if new_host_idx is None:
+        for potential_host in mobility_host_indices:
+            if host_to_vtep_index(potential_host) == new_vtep_idx:
+                new_host_idx = potential_host
+                break
+
+    assert new_host_idx is not None, f"No destination host found for VTEP index {new_vtep_idx}"
+
+    vm_ip = f"192.168.100.{vm_idx}/16"
+    vm_mac = "00:aa:bb:cc:{:02x}:{:02x}".format((vm_idx >> 8) & 0xFF, vm_idx & 0xFF)
+
+    return {
+        "vm_name": vm_name,
+        "old_host_name": old_host_name,
+        "old_vtep_idx": old_vtep_idx,
+        "old_vtep_name": vtep_name_from_index(old_vtep_idx),
+        "new_host_name": f"host{new_host_idx}",
+        "new_host_idx": new_host_idx,
+        "new_vtep_idx": new_vtep_idx,
+        "new_vtep_name": vtep_name_from_index(new_vtep_idx),
+        "vm_ip": vm_ip,
+        "vm_mac": vm_mac,
+    }
+
+
+def migrate_macvlan_endpoints_live_batch(tgen, migration_batch):
+    """Move a batch by creating all destinations first, then deleting all sources.
+
+    For each migrated VM, an LMEP binary TLV registration is sent to the
+    external Mapping Server so it updates its MAC-to-VTEP table.
+    """
+    created_destinations = []
+
+    try:
+        for migration in migration_batch:
+            create_macvlan_endpoint(
+                tgen,
+                migration["new_host_name"],
+                migration["vm_name"],
+                migration["vm_ip"],
+                migration["vm_mac"],
+            )
+
+            if not macvlan_endpoint_exists(
+                tgen,
+                migration["new_host_name"],
+                migration["vm_name"],
+            ):
+                raise AssertionError(
+                    f"destination endpoint {migration['vm_name']} missing on {migration['new_host_name']} after create"
+                )
+
+            created_destinations.append(
+                (migration["new_host_name"], migration["vm_name"])
+            )
+
+            # Send LMEP binary TLV registration to update the Mapping Server.
+            new_vtep_ip = vtep_ips[migration["new_vtep_name"]]
+            try:
+                send_lmep_registration(
+                    LMEP_SERVER_HOST,
+                    migration["vm_mac"],
+                    migration["vm_ip"],
+                    LMEP_DEFAULT_VNI,
+                    new_vtep_ip,
+                )
+            except OSError as exc:
+                logger.warning(
+                    "LMEP registration failed for %s -> %s: %s",
+                    migration["vm_name"],
+                    new_vtep_ip,
+                    exc,
+                )
+    except Exception as error:
+        # Roll back already-created destination endpoints on failure.
+        if created_destinations:
+            print(
+                "WARNING: batch migration destination create failed; "
+                f"rolling back {len(created_destinations)} created endpoints. "
+                f"Error: {error}"
+            )
+            for host_name, vm_name in reversed(created_destinations):
+                delete_macvlan_endpoint_if_exists(tgen, host_name, vm_name)
+        raise
+
+    sleep(MOBILITY_OVERLAP_SECONDS)
+
+    for migration in migration_batch:
+        delete_macvlan_endpoint(
+            tgen,
+            migration["old_host_name"],
+            migration["vm_name"],
+        )
+        if macvlan_endpoint_exists(
+            tgen,
+            migration["old_host_name"],
+            migration["vm_name"],
+        ):
+            print(
+                "WARNING: source endpoint still present after delete; forcing cleanup for "
+                f"{migration['vm_name']} on {migration['old_host_name']}"
+            )
+            delete_macvlan_endpoint_if_exists(
+                tgen,
+                migration["old_host_name"],
+                migration["vm_name"],
+            )
+
+
+#####################################################
+##   Packet Capture Helpers
+#####################################################
 
 def get_pcap_packet_count(node, file_path):
     """Return packet count, or 'missing' when the pcap does not exist."""
@@ -467,106 +564,129 @@ def format_nlri_counts(counts):
         counts["both"],
     )
 
-def stop_background_ping(host_name, pid):
-    tgen = get_topogen()
-    host = tgen.gears[host_name]
-    if host_name == "vtep1":
-        host.run(f"kill {pid}")
-    else:
-        host.run(f"kill -2 {pid} || true")
 
-def get_dummy_mac(dummy_name):
-    """Return the MAC associated with a dummy interface name."""
-    dummy_id = dummy_name.replace("dummy", "")
-    return f"00:00:00:00:ff:{int(dummy_id):02x}"
-
-def start_fdb_monitor_on_node(node, out_path="/tmp/outputs/fdb_vtep1_sorry6.txt", pid_path="/tmp/outputs/fdb_monitor.pid"):
-    """
-    Install and start a small Python script on the `node` that runs:
-        bridge monitor fdb
-    and prefixes each output line with a millisecond epoch timestamp.
-    The monitor runs in background via nohup and the PID is written to pid_path.
-    Returns the PID as a string (or None on failure).
-    """
-    # ensure outputs dir exists on node
-    try:
-        node.run("mkdir -p /tmp/outputs")
-    except Exception:
-        pass
-
-    # small python monitor script; write it to the node
-    monitor_py = r'''#!/usr/bin/env python3
-import subprocess, sys, time
-# Run bridge monitor fdb and prefix each line with ms epoch timestamp
-p = subprocess.Popen(["bridge", "monitor", "fdb"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-for ln in p.stdout:
-    try:
-        sys.stdout.write(f"{int(time.time()*1000)} {ln}")
-        sys.stdout.flush()
-    except Exception:
-        # on any error just continue to avoid monitor dying silently
-        pass
-'''
-    # write the script to node
-    node.run("cat > /tmp/outputs/fdb_monitor_vtep1.py <<'PY'\n" + monitor_py + "\nPY")
-    node.run("chmod +x /tmp/outputs/fdb_monitor_vtep1.py || true")
-    # truncate the output file before starting the script
-    node.run(f"> {out_path}")
-    # start it in background with nohup, save pid
-    # echo pid into pid_path then output it so caller can capture
-    start_cmd = (
-        f"nohup python3 /tmp/outputs/fdb_monitor_vtep1.py >> {out_path} 2>&1 & echo $! > {pid_path} && cat {pid_path} || true"
+def start_bgp_capture(node, pcap_file, pid_file):
+    """Start a detached tcpdump capture for BGP control-plane traffic."""
+    node.run(
+        "tcpdump -nni any -s 0 -w {} port 179 2>/dev/null & echo $! > {}".format(
+            shlex.quote(pcap_file),
+            shlex.quote(pid_file),
+        ),
+        stdout=None,
     )
-    try:
-        pid = node.run(start_cmd).strip()
-        if not pid:
-            return None
-        return pid
-    except Exception:
-        return None
 
 
-def stop_fdb_monitor_on_node(node, pid_path="/tmp/outputs/fdb_monitor.pid"):
-    """
-    Kill the monitor whose PID is saved in pid_path on the node (if present).
-    Removes pid file.
-    """
+def stop_bgp_capture(node, pid_file):
+    """Stop a detached tcpdump capture if it is running."""
+    node.run(
+        "if [ -f {0} ]; then kill $(cat {0}) 2>/dev/null || true; fi".format(
+            shlex.quote(pid_file)
+        )
+    )
+
+
+#####################################################
+##   Network Topology Definition
+#####################################################
+
+def build_topo(tgen):
+    """Build a 2-spine, N-VTEP, N-host Clos-style topology."""
+
+    spine1 = tgen.add_router("spine1")
+    spine2 = tgen.add_router("spine2")
+
+    # Create VTEPs and connect to both spines.
+    for i in range(1, NUM_VTEPS + 1):
+        vtep_name = f"vtep{i}"
+        tgen.add_router(vtep_name)
+        tgen.add_link(spine1, tgen.gears[vtep_name])
+        tgen.add_link(spine2, tgen.gears[vtep_name])
+
+    # Create hosts and distribute them across VTEPs.
+    for i in range(1, NUM_HOSTS + 1):
+        host_name = f"host{i}"
+        tgen.add_router(host_name)
+        vtep_idx = (i - 1) % NUM_VTEPS
+        vtep_name = f"vtep{vtep_idx + 1}"
+        tgen.add_link(tgen.gears[vtep_name], tgen.gears[host_name])
+
+
+@pytest.fixture(scope="module")
+def tgen(request):
+    """Setup/Teardown the environment and provide tgen argument to tests."""
+
+    tgen = Topogen(build_topo, request.module.__name__)
+    tgen.start_topology()
+
+    krel = platform.release()
+    if topotest.version_cmp(krel, "4.19") < 0:
+        tgen.errors = "kernel 4.19 needed for multihoming tests"
+        pytest.skip(tgen.errors)
+
+    # Configure all VTEPs
+    vteps = [f"vtep{i}" for i in range(1, NUM_VTEPS + 1)]
+    config_vteps(tgen, vteps)
+
+    # Configure all hosts
+    hosts = [f"host{i}" for i in range(1, NUM_HOSTS + 1)]
+    config_hosts(tgen, hosts)
+
+    router_list = tgen.routers()
+    for rname, router in router_list.items():
+        router.load_config(
+            TopoRouter.RD_ZEBRA, os.path.join(CWD, "{}/zebra.conf".format(rname))
+        )
+        router.load_config(
+            TopoRouter.RD_BGP, os.path.join(CWD, "{}/evpn.conf".format(rname))
+        )
+    tgen.start_router()
+
+    yield tgen
+
+    # Suppress the memory allocation report during topology teardown.
+    original_stderr = sys.stderr
+    sys.stderr = open(os.devnull, "w")
     try:
-        out = node.run(f"test -f {pid_path} && cat {pid_path} || true").strip()
-        if out:
-            node.run(f"kill {out} || true")
-        node.run(f"rm -f {pid_path} || true")
-    except Exception:
-        pass
+        tgen.stop_topology()
+    finally:
+        sys.stderr.close()
+        sys.stderr = original_stderr
+
+
+@pytest.fixture(autouse=True)
+def skip_on_failure(tgen):
+    if tgen.routers_have_failure():
+        pytest.skip("skipped because of previous test failure")
+
+
+#####################################################
+##   Test Functions
+#####################################################
 
 def test_host_movement(tgen):
-    """
-    Test host movement between two TORs using macvlan interfaces.
-    Only a single host can move to a VTEP at a time, because the vtepbond
-    interface can only hold one MAC address per macvlan interface.
-    When the host moves, the MAC address appears at the new VTEP with an
-    updated sequence number, so the previous VTEP forwards traffic to the new VTEP.
-    This means two hosts cannot be moved to the same VTEP simultaneously
-    if they share the same MAC on the vtepbond interface.
+    """Simulate endpoint mobility across VTEPs with LMEP registration.
 
-    Example registration payload:
-    {"action": "register", "mac": "00:00:00:00:ff:aa", "client_ip": "192.168.1.10/16", "vni": 1000, "vtep_ip": "10.10.10.10"}
+    This test mirrors bgp_evpn_capstone_asym's mobility simulation but adds
+    binary TLV LMEP registration at each migration step.
+
+    Steps:
+    1. Deploy mobile VMs distributed across mobility-eligible hosts
+    2. Create a static controller endpoint on the controller VTEP
+    3. Live-migrate the full VM set for MIGRATION_REPEAT_COUNT rounds
+       (brief duplicate-MAC window with LMEP registration at each move)
+    4. Capture BGP packet data during migrations
     """
-    # If any router has previously failed in another test, skip this one.
     if tgen.routers_have_failure():
         pytest.skip(f"skipped because of previous test failure\n {tgen.errors}")
-    
-    output = "/"
-    # print(tester.vtysh_cmd("show evpn mac vni 1000"))
-    # pdb.set_trace()
-    # Start continuous ping from host3 to monitor connectivity during movement
 
-    spine1 = tgen.gears["spine1"]
-    vtep1 = tgen.gears["vtep1"]
-    vtep2 = tgen.gears["vtep2"]
-    vtep3 = tgen.gears["vtep3"]
+    mobility_vtep_indices = get_mobility_vtep_indices()
+    mobility_host_indices = get_mobility_host_indices()
 
-    # Fail fast with an actionable error if the standalone LMEP daemon is not reachable.
+    assert mobility_vtep_indices, "No mobility-eligible VTEPs are configured"
+    assert len(mobility_vtep_indices) >= 2, "Need at least two mobility-eligible VTEPs"
+    assert mobility_host_indices, "No mobility-eligible hosts are available"
+
+    # Fail fast if the LMEP server is not reachable.
     try:
         _send_lmep_registration_udp(
             LMEP_SERVER_HOST, LMEP_PORT,
@@ -578,133 +698,138 @@ def test_host_movement(tgen):
             "Start lmep_server.py or set LMEP_SERVER_HOST/LMEP_PORT."
         )
 
+    #####################################################
+    # SECTION: Packet Capture Setup
+    #####################################################
+    spine1 = tgen.gears["spine1"]
+    vtep2 = tgen.gears["vtep2"]
+    vtep3 = tgen.gears["vtep3"]
+
     pcap_plan = {
-        "spine1": (spine1, os.path.join(tgen.logdir, "spine1", "spine1_lmep_mobility.pcap"), "/tmp/tcpdump_lmep_spine1.pid"),
-        "vtep1": (vtep1, os.path.join(tgen.logdir, "vtep1", "vtep1_lmep_mobility.pcap"), "/tmp/tcpdump_lmep_vtep1.pid"),
-        "vtep2": (vtep2, os.path.join(tgen.logdir, "vtep2", "vtep2_lmep_mobility.pcap"), "/tmp/tcpdump_lmep_vtep2.pid"),
-        "vtep3": (vtep3, os.path.join(tgen.logdir, "vtep3", "vtep3_lmep_mobility.pcap"), "/tmp/tcpdump_lmep_vtep3.pid"),
+        "spine1": (
+            spine1,
+            os.path.join(tgen.logdir, "spine1", "spine1_lmep_mobility.pcap"),
+            "/tmp/tcpdump_lmep_spine1.pid",
+        ),
+        "vtep1": (
+            tgen.gears["vtep1"],
+            os.path.join(tgen.logdir, "vtep1", "vtep1_lmep_mobility.pcap"),
+            "/tmp/tcpdump_lmep_vtep1.pid",
+        ),
+        "vtep2": (
+            vtep2,
+            os.path.join(tgen.logdir, "vtep2", "vtep2_lmep_mobility.pcap"),
+            "/tmp/tcpdump_lmep_vtep2.pid",
+        ),
+        "vtep3": (
+            vtep3,
+            os.path.join(tgen.logdir, "vtep3", "vtep3_lmep_mobility.pcap"),
+            "/tmp/tcpdump_lmep_vtep3.pid",
+        ),
     }
 
     print("\nStarting BGP control-plane captures for LMEP test...")
+    print(f"Mobility overlap timer: {MOBILITY_OVERLAP_SECONDS:.3f}s")
+    print(f"Migration batch size: {MIGRATION_BATCH_SIZE}")
+    print(f"Migration repeat count: {MIGRATION_REPEAT_COUNT}")
+    print(f"Batch settle timer: {MIGRATION_BATCH_SETTLE_SECONDS:.3f}s")
+
     for capture_name, (node, pcap_file, pid_file) in pcap_plan.items():
         start_bgp_capture(node, pcap_file, pid_file)
-        print(f"{capture_name} capture file: {pcap_file}")
+        print(f"  {capture_name} capture: {pcap_file}")
 
     sleep(1)
-    
-    hosts = ["host1", "host2"]
-    delay_data = {}
-    pre_movement_details = []
-    after_movement_details = []
-
-    last_move_error = {"details": ""}
-
-    def move_host_from(targeted_if,delay=0):
-        
-        sleep(delay)
-        
-        # Get the current host name and randomly select a different target host
-        current_hostname = dummy_to_host_map[targeted_if]
-        possible_targets = [h for h in hosts if h != current_hostname and h != "host3"]
-        target_hostname = random.choice(possible_targets)
-        # target_hostname = "host1"  # Forcing movement to host2 for easier debugging
-        dummy_to_host_map[targeted_if] = target_hostname
-
-        # Get the current and target host nodes
-        curr_host = tgen.gears[current_hostname]
-        target_host = tgen.gears[target_hostname]
-
-        def run_command_and_expect():
-            nonlocal last_move_error
-            config_dummy(targeted_if, target_host)
-            # Delete the macvlan interface from the previous host
-            curr_host.run(f"ip link delete {targeted_if}")
-            vtep_name = target_hostname.replace("host", "vtep")
-            vtep_ip = vtep_ips[vtep_name]
-
-            # Send binary TLV registration to external LMEP server
-            try:
-                send_mac_registration(None, LMEP_SERVER_HOST, targeted_if, vtep_ip)
-            except OSError as exc:
-                last_move_error["details"] = f"registration send failed: {exc}"
-                return False
-
-            # Verify EVPN MAC state reflects the movement
-            dummy_mac = get_dummy_mac(targeted_if)
-            output = tgen.gears["vtep1"].vtysh_cmd(
-                "show evpn mac vni 1000 json", isjson=True
-            )
-            mac_entry = output.get("macs", {}).get(dummy_mac)
-            if mac_entry is None:
-                last_move_error["details"] = f"MAC {dummy_mac} not found in EVPN table"
-                return False
-
-            move_ts_ms = int(time() * 1000)
-            if dummy_mac == "00:00:00:00:ff:01":
-                after_movement_details.append({
-                    "mac": dummy_mac,
-                    "time": move_ts_ms,
-                    "interface": targeted_if,
-                    "from": current_hostname,
-                    "to": target_hostname,
-                    "delay": delay
-                })
-            return True
-
-        _, result = topotest.run_and_expect(
-        run_command_and_expect,
-        True,   # EXPECTED OUTPUT
-        count=5,  # Try up to 5 times
-        wait=3     # waiting 3 seconds between tries
-        )
-
-        # print(f"--- Host moved from {current_hostname} to {target_hostname} at {time()} ---")
-        assert result is True, (
-        f"The MAC and IP address in {current_hostname} has not moved\n"
-        f"Last retry error: {last_move_error.get('details', 'unknown')}"
-        )
 
     try:
+        # Create static controller endpoint before mobility begins.
+        create_controller_endpoint(tgen)
+
+        #####################################################
+        # SECTION: Mobility Simulation
+        #####################################################
+        print(f"\n=== Starting LMEP Mobility Test with {NUM_MOBILE_VMS} VMs ===\n")
+
+        # Track VM locations: {vm_name: (current_host_idx, current_vtep_idx)}
+        vm_locations = {}
+
+        # --- Phase 1: Deploy VMs on initial hosts ---
+        print(f"Phase 1: Deploying {NUM_MOBILE_VMS} VMs on hosts...")
+
+        for vm_idx in range(1, NUM_MOBILE_VMS + 1):
+            vm_name = f"vm{vm_idx}"
+            vm_ip = f"192.168.100.{vm_idx}/16"
+            vm_mac = "00:aa:bb:cc:{:02x}:{:02x}".format((vm_idx >> 8) & 0xFF, vm_idx & 0xFF)
+
+            host_idx = mobility_host_indices[(vm_idx - 1) % len(mobility_host_indices)]
+            host_name = f"host{host_idx}"
+            vtep_idx = host_to_vtep_index(host_idx)
+
+            create_macvlan_endpoint(tgen, host_name, vm_name, vm_ip, vm_mac)
+            vm_locations[vm_name] = (host_idx, vtep_idx)
+
+            # Send initial LMEP registration.
+            vtep_ip = vtep_ips[vtep_name_from_index(vtep_idx)]
+            try:
+                send_lmep_registration(
+                    LMEP_SERVER_HOST, vm_mac, vm_ip, LMEP_DEFAULT_VNI, vtep_ip
+                )
+            except OSError:
+                pass  # Best-effort during initial deployment.
+
+            if vm_idx % 5 == 0:
+                sleep(1)
+
         sleep(5)
 
-        # fdb_pid = start_fdb_monitor_on_node(tgen.gears["vtep3"], out_path="/tmp/outputs/fdb_vtep3.txt", pid_path="/tmp/outputs/fdb_monitor_vtep3.pid")
-        # logger.info(f"Started FDB monitor on vtep3 with PID {fdb_pid}")
-        # pid_ping = start_background_ping("host3", "192.168.0.1")
-        # pid_capture1 = start_packet_capture("vtep3", f"vtep3_capture_{number_of_dummy}.pcap")
-        # pid_capture2 = start_packet_capture("vtep2", f"vtep2_capture_{number_of_dummy}.pcap")
-        # pid_capture3 = start_packet_capture("spine1", f"spine1_capture_{number_of_dummy}.pcap")
-        sleep(15)  # wait for some pings to be sent
+        # --- Phase 2: Post-deployment settle ---
+        print("\nPhase 2: Initial deployment complete; proceeding to mobility...")
 
-        # delays = [2, 1, 0.8, 0.5, 0.2, 0.1, 0]
-        delays = [1]
-        moves_per_dummy = 1
-        moves = moves_per_dummy * number_of_dummy
+        # --- Phase 3: Migrate VMs to different VTEPs ---
+        print(
+            f"\nPhase 3: Moving {NUM_MOBILE_VMS} VMs to different locations "
+            f"for {MIGRATION_REPEAT_COUNT} round(s)..."
+        )
 
-        # delays = [1]
-        for delay in delays:
-            for i in range(moves):
-                select_dummy = "dummy" + str((i % number_of_dummy) + 1)
-                # select_dummy = "dummy1"
-                move_host_from(select_dummy,delay)
-                logger.info(f"{select_dummy} moved")
-            sleep(5)
+        for migration_round in range(1, MIGRATION_REPEAT_COUNT + 1):
+            print(f"  Starting migration round {migration_round}/{MIGRATION_REPEAT_COUNT}")
 
-        sleep(15)
-        # stop_background_ping("vtep3", pid_capture1)
-        # stop_background_ping("host3", pid_ping)
-        # stop_background_ping("vtep2", pid_capture2)
-        # stop_background_ping("spine1", pid_capture3)
-        sleep(10)
-        # stop_fdb_monitor_on_node(tgen.gears["vtep3"], pid_path="/tmp/outputs/fdb_monitor_vtep3.pid")
-        # logger.info("Stopped FDB monitor on vtep3")
+            for batch_start in range(1, NUM_MOBILE_VMS + 1, MIGRATION_BATCH_SIZE):
+                batch_end = min(batch_start + MIGRATION_BATCH_SIZE - 1, NUM_MOBILE_VMS)
+                migration_batch = []
 
-        # with open("/tmp/outputs/after_movement_details.json", "w") as f:
-        #     json.dump(after_movement_details, f, indent=2)
-        # with open(f"/tmp/outputs/info_{number_of_dummy}_{delays[0]}.txt", "w") as f:
-        #     f.write(f"number_of_dummy: {number_of_dummy}\n")
-        #     f.write(f"delay: {delays[0]}\n")
-        #     f.write(f"moves: {moves}\n")
-        #     f.write(f"moves_per_dummy: {moves_per_dummy}\n")
+                for vm_idx in range(batch_start, batch_end + 1):
+                    migration_batch.append(
+                        build_vm_migration_plan(
+                            vm_idx,
+                            vm_locations,
+                            mobility_vtep_indices,
+                            mobility_host_indices,
+                        )
+                    )
+
+                migrate_macvlan_endpoints_live_batch(tgen, migration_batch)
+
+                for migration in migration_batch:
+                    vm_locations[migration["vm_name"]] = (
+                        migration["new_host_idx"],
+                        migration["new_vtep_idx"],
+                    )
+
+                moved_count = batch_end
+                if moved_count % 20 == 0 or moved_count == NUM_MOBILE_VMS:
+                    print(
+                        f"  Round {migration_round}/{MIGRATION_REPEAT_COUNT} progress: "
+                        f"{moved_count}/{NUM_MOBILE_VMS}"
+                    )
+
+                if MIGRATION_BATCH_SETTLE_SECONDS > 0.0:
+                    sleep(MIGRATION_BATCH_SETTLE_SECONDS)
+
+        sleep(5)
+
+        # --- Phase 4: Post-migration ---
+        print("\nPhase 4: Post-migration checks complete.")
+
     finally:
         print("\nStopping BGP captures and collecting packet metrics...")
         for _, (node, _, pid_file) in pcap_plan.items():
@@ -715,16 +840,28 @@ def test_host_movement(tgen):
         for capture_name, (node, pcap_file, _) in pcap_plan.items():
             packet_count = get_pcap_packet_count(node, pcap_file)
             nlri_counts = get_pcap_mp_nlri_counts(node, pcap_file)
-            print(f"{capture_name} BGP packets: {packet_count}")
-            print(f"{capture_name} MP_NLRI: {format_nlri_counts(nlri_counts)}")
+            print(f"  {capture_name} BGP packets: {packet_count}")
+            print(f"  {capture_name} MP_NLRI: {format_nlri_counts(nlri_counts)}")
+            print()
+
+        sleep(5)
+
+        # Remove controller endpoint.
+        delete_macvlan_endpoint_if_exists(
+            tgen,
+            CONTROLLER_ENDPOINT_HOST,
+            CONTROLLER_ENDPOINT_IFACE,
+        )
+
+    if os.getenv("MUNET_CLI") == "1":
+        tgen.mininet_cli()
 
 
 def test_get_version(tgen):
-    "Test the logs the FRR version"
-
+    """Sanity check that queries the EVPN MAC table."""
     r1 = tgen.gears["vtep1"]
     version = r1.vtysh_cmd("show evpn mac vni 1000")
-    # logger.info("=-=-=-=-=-==-FRR version is: " + version)
+
 
 if __name__ == "__main__":
     args = ["-s"] + sys.argv[1:]

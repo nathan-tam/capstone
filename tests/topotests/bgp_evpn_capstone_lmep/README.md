@@ -11,6 +11,8 @@ This folder contains the topotest setup for the Layer-2 Mapping & Encapsulation 
 - [The Test Topology](#the-test-topology)
 - [The Registration Protocol (Binary TLV)](#the-registration-protocol-binary-tlv)
 - [The Forwarding Model (Scapy Sniffing)](#the-forwarding-model-scapy-sniffing)
+- [Production vs Test Deployment](#production-vs-test-deployment)
+- [What the APs Need](#what-the-aps-need)
 - [How to Run Everything](#how-to-run-everything)
 - [How to Verify It Works](#how-to-verify-it-works)
 - [What the Tests Validate](#what-the-tests-validate)
@@ -49,9 +51,11 @@ In a traditional data center network, when a switch receives a packet addressed 
 ### How LMEP Works
 
 At a high level, LMEP has two planes:
+- Control Plane, which handles the registration of MAC addresses to VTEPs
+- Data Plane, which handles the forwarding of packets to the correct VTEPs
 
-### Control Plane: Registration
-
+**Control Plane: Registration**
+<br>
 When an endpoint (e.g., a mobile robot) connects to a wireless access point:
 
 1. The AP detects the new connection and immediately sends a **MAC registration message** to the Mapping Server.
@@ -60,8 +64,8 @@ When an endpoint (e.g., a mobile robot) connects to a wireless access point:
 
 This registration happens **pre-emptively** — the AP sends it as soon as the client starts associating, before the client has fully connected. This minimizes the window where traffic could be "black-holed" (sent to the wrong place because the server doesn't know the client's new location yet).
 
-### Data Plane: Intercept & Forward
-
+**Data Plane: Intercept & Forward**
+<br>
 When the controller needs to send a command to a robot:
 
 1. **Intercept**: The controller sends a plain Ethernet frame addressed to the robot's MAC address. The Mapping Server's "listening interface" captures this frame.
@@ -69,11 +73,11 @@ When the controller needs to send a command to a robot:
 3. **Encapsulate**: The server wraps the original Ethernet frame inside a VXLAN packet, setting the outer destination IP to the VTEP where the robot is attached.
 4. **Forward**: The VXLAN packet travels across the network to the destination VTEP, which strips off the VXLAN header and delivers the original frame to the robot.
 
-Return traffic (robot → controller) does **not** go through LMEP. Since the controller is not mobile, return traffic uses normal VXLAN or IP routing.
+Return traffic (from the robot to the controller) does **not** go through LMEP. Since the controller is not mobile, return traffic uses normal VXLAN or IP routing.
 
 ---
 
-## System Architecture (This Implementation)
+### Test Architecture
 
 There are three separate components:
 
@@ -83,12 +87,12 @@ There are three separate components:
 │                                                                        │
 │  ┌──────────────────┐        ┌──────────────────────────────────────┐  │
 │  │  LMEP Server     │        │  Topotest (pytest)                   │  │
-│  │  (lmep_server.py)│ ◄──── │  Virtual topology with FRR routers   │  │
+│  │  (lmep_server.py)│ ◄────  │  Virtual topology with FRR routers   │  │
 │  │                  │  UDP   │                                      │  │
-│  │  • Listens for   │  TLV   │  spine1 ── vtep1 ── host1            │  │
-│  │    registrations │  reg   │  spine1 ── vtep2 ── host2            │  │
-│  │  • Sniffs packets│        │  spine1 ── vtep3 ── host3            │  │
-│  │  • Forwards via  │        │  spine2 ── vtep1/2/3                 │  │
+│  │  • Listens for   │  TLV   │  2 spines ── 7 VTEPs ── 7 hosts     │  │
+│  │    registrations │  reg   │  vtep1 = controller (no mobility)    │  │
+│  │  • Sniffs packets│        │  vtep2-7 = mobility-eligible         │  │
+│  │  • Forwards via  │        │  30 mobile VMs across vtep2-7        │  │
 │  │    VXLAN         │        │                                      │  │
 │  └──────────────────┘        └──────────────────────────────────────┘  │
 └────────────────────────────────────────────────────────────────────────┘
@@ -113,33 +117,46 @@ The LMEP server runs on the host machine rather than inside a topotest namespace
 
 ## The Test Topology
 
-The test creates a spine-leaf fabric with 3 VTEPs, each connected to a host:
+The test creates a spine-leaf fabric with 7 VTEPs and 7 hosts (matching the `bgp_evpn_capstone_asym` test for fair comparison):
 
 ```
-         ┌────────┐     ┌────────┐
-         │ spine1 │     │ spine2 │
-         └─┬──┬──┬┘     └┬──┬──┬─┘
-           │  │  │        │  │  │
-     ┌─────┘  │  └────┐  │  │  │
-     │     ┌──┘  ┌────┼──┘  │  │
-     │     │     │    │  ┌──┘  │
-   ┌─┴──┐ ┌┴───┐ ┌┴──┐ │     │
-   │vtep1│ │vtep2│ │vtep3│◄────┘
-   └──┬──┘ └──┬──┘ └──┬──┘
-      │       │       │
-   ┌──┴──┐ ┌──┴──┐ ┌──┴──┐
-   │host1│ │host2│ │host3│
-   └─────┘ └─────┘ └─────┘
+             ┌────────┐           ┌────────┐
+             │ spine1 │           │ spine2 │
+             └┬┬┬┬┬┬┬┘           └┬┬┬┬┬┬┬┘
+              ││││││└───────┐      ││││││└───────┐
+              │││││└─────┐  │      │││││└─────┐  │
+              ││││└───┐  │  │      ││││└───┐  │  │
+              │││└─┐  │  │  │      │││└─┐  │  │  │
+              ││└┐ │  │  │  │      ││└┐ │  │  │  │
+              │└┐│ │  │  │  │      │└┐│ │  │  │  │
+              │ ││ │  │  │  │      │ ││ │  │  │  │
+          vtep1 vtep2 vtep3 vtep4 vtep5 vtep6 vtep7
+           │     │     │     │     │     │     │
+          host1 host2 host3 host4 host5 host6 host7
 ```
 
-- **Spines** (`spine1`, `spine2`) — BGP route reflectors connecting all VTEPs. They don't attach to hosts directly.
-- **VTEPs** (`vtep1`, `vtep2`, `vtep3`) — leaf switches that terminate VXLAN tunnels. Each has a loopback IP (`10.10.10.10`, `20.20.20.20`, `30.30.30.30`) used as the VTEP tunnel source address.
-- **Hosts** (`host1`, `host2`, `host3`) — simulated endpoints connected to VTEPs via bonded interfaces (`vtepbond`). The test creates additional **macvlan** "dummy" interfaces on these hosts to simulate multiple endpoints that can be moved between VTEPs.
+- **Spines** (`spine1`, `spine2`) — BGP route reflectors connecting all 7 VTEPs.
+- **Controller VTEP** (`vtep1`) — excluded from endpoint mobility. A static controller endpoint (`host1`) is attached here.
+- **Mobility VTEPs** (`vtep2`–`vtep7`) — leaf switches where mobile VM endpoints are created and migrated between.
+- **Hosts** (`host1`–`host7`) — one per VTEP, connected via bonded interfaces (`vtepbond`). The test creates **macvlan** VM interfaces on these hosts to simulate mobile endpoints.
 
 Each VTEP has:
 - A Linux bridge (`br1000`) serving as the Layer-2 domain.
 - A VXLAN interface (`vni1000`) bound to VNI 1000, connecting the bridge to the VXLAN overlay.
 - An SVI (Switch Virtual Interface) IP address on the bridge for anycast gateway functionality.
+- A loopback IP used as the VTEP tunnel source (`10.10.10.10` for vtep1, `20.20.20.20` for vtep2, ..., `70.70.70.70` for vtep7).
+
+### Scaling Parameters
+
+All parameters can be overridden via environment variables:
+
+| Parameter | Default | Env Var | Description |
+|---|---|---|---|
+| Mobile VMs | 30 | `NUM_MOBILE_VMS` | Number of MACVLAN endpoints to create and migrate |
+| Migration batch size | 5 | `MIGRATION_BATCH_SIZE` | How many VMs to move in each batch (destination created before source deleted) |
+| Migration rounds | 5 | `MIGRATION_REPEAT_COUNT` | How many full rounds of migration to run |
+| Overlap timer | 0.2s | `MOBILITY_OVERLAP_SECONDS` | How long to keep both source and destination alive during migration |
+| Batch settle | 0.6s | `MIGRATION_BATCH_SETTLE_SECONDS` | Pause between migration batches |
 
 ---
 
@@ -218,6 +235,86 @@ Scapy is used because it can:
 - **Send raw frames** at Layer 2 — normal socket programming can only send at Layer 3 (IP) or above. VXLAN encapsulation requires building the full Ethernet + IP + UDP + VXLAN stack.
 
 The tradeoff is that Scapy requires **root privileges** because it uses raw sockets to access the network interface directly.
+
+---
+
+## Production vs Test Deployment
+
+The `--iface` flag (e.g., `--iface eth0`) tells the LMEP server which network interface to sniff on and send VXLAN packets from. What this interface represents is very different depending on whether you're running in production or in the test environment.
+
+### In a production network
+
+The Mapping Server would be a physical or virtual appliance sitting on the **same network segment as the controller**. The `--iface` would point to the NIC that connects to that segment:
+
+```
+                        Controller's Network Segment
+                    ════════════════════════════════════
+                         │                    │
+                    ┌────┴────┐          ┌────┴────────────┐
+                    │Controller│          │ LMEP Mapping    │
+                    │(sends    │          │ Server          │
+                    │commands) │          │                 │
+                    └─────────┘          │ eth0 ← sniffs   │
+                                         │   this interface │
+                                         │                 │
+                                         │ eth1 (or same)  │
+                                         │   → sends VXLAN │
+                                         └────┬────────────┘
+                                              │
+                                    Underlay / VXLAN Fabric
+                                ══════════════════════════════
+                                  │          │          │
+                              ┌───┴──┐   ┌───┴──┐  ┌───┴──┐
+                              │VTEP 1│   │VTEP 2│  │VTEP 3│
+                              └──┬───┘   └──┬───┘  └──┬───┘
+                                 │          │          │
+                              [Robot]    [Robot]    [Robot]
+```
+
+The controller sends plain Ethernet frames addressed to a robot's MAC (e.g., `00:00:00:00:ff:01`). Because the Mapping Server's `eth0` is on the **same broadcast domain**, Scapy's `sniff()` sees those frames arrive. It looks up the destination MAC, wraps the frame in VXLAN, and sends the encapsulated packet toward the correct VTEP.
+
+So in production, `eth0` is the **"listening port"** described in the LMEP Standard — the controller-facing interface where traffic interception happens. If the server has a separate NIC for reaching the underlay fabric, you could use that for sending VXLAN packets, but the current implementation sniffs and sends on the same interface for simplicity.
+
+### In the test environment
+
+The test setup is quite different from production because everything runs on a single machine:
+
+- The topotest topology (spines, VTEPs, hosts) lives inside **Linux network namespaces** — virtual isolated networks that behave like separate machines but share the same physical host.
+- The LMEP server runs on the **host machine's network stack** (outside any namespace), and `eth0` refers to the host's default NIC.
+- Registration messages are sent directly from the test process (which also runs on the host) to the server via `127.0.0.1` — they never cross namespace boundaries.
+- The Scapy sniffing/forwarding side is more of a proof-of-concept in this context. The primary thing being tested is the registration protocol and the EVPN MAC state verification.
+
+This is why the test uses `LMEP_SERVER_HOST=127.0.0.1` by default — both the test process and the server are on the same host, so localhost works.
+
+---
+
+## What the APs Need
+
+The binary TLV registration messages are **custom to LMEP** — they are not part of any existing wireless or networking standard (not 802.11, not RADIUS, not CAPWAP, etc.). This means that in a real production deployment, the APs would need some form of LMEP-aware software to send these registration packets.
+
+There are several practical approaches, depending on the AP hardware:
+
+### Option 1: Linux-based APs (e.g., OpenWRT)
+
+Many enterprise and open-source APs run a standard Linux kernel. On these, you would install a small daemon or script that:
+- Monitors the wireless interface for new client associations (e.g., via `hostapd` events or `iw` event monitoring).
+- When a client begins associating, immediately constructs a binary TLV registration packet and sends it via UDP to the Mapping Server's IP and port.
+
+This is the simplest approach — the AP is just a Linux box, so you write a small program that listens for wireless events and sends UDP datagrams. The registration sender could be as small as 30–40 lines of Python.
+
+### Option 2: APs with container/hypervisor support (e.g., Cisco)
+
+Some high-end enterprise APs (like certain Cisco models) include a micro-hypervisor or container runtime. You could deploy a small Docker container on the AP that runs the LMEP registration agent, with access to wireless client events.
+
+### Option 3: gNMI telemetry streams (alternative to custom TLV)
+
+Instead of using the custom binary TLV protocol, you could replace the registration mechanism entirely with **gNMI** (gRPC Network Management Interface) streams. Many modern APs and controllers expose gNMI telemetry about client associations. The Mapping Server could subscribe to a gNMI stream and react to client-connect events, extracting the MAC and VTEP information from the telemetry data instead of receiving a purpose-built registration packet.
+
+This would reduce the amount of custom software needed on the APs (since gNMI is already a supported standard on many platforms), but would require the Mapping Server to maintain a gNMI subscription and parse the telemetry format.
+
+### In the test environment
+
+In our topotest, there are no real APs. The **test script itself plays the role of the AP** — when it moves a dummy macvlan interface from one host to another, it sends the binary TLV registration message directly to the LMEP server from the test process. This simulates what an AP would do in production.
 
 ---
 
@@ -322,16 +419,17 @@ The test file (`test_evpn_capstone_lmep.py`) contains two test functions:
 
 ### `test_host_movement`
 
-This is the main test. It:
+This is the main test, mirroring `bgp_evpn_capstone_asym`'s mobility simulation. It:
 
-1. **Sets up the topology** — creates bridges, VXLAN interfaces, bonds, and macvlan "dummy" interfaces to simulate multiple endpoints distributed across hosts.
-2. **Starts packet captures** — begins tcpdump on BGP port 179 on all spines and VTEPs to measure control-plane traffic.
-3. **Moves endpoints** — for each "dummy" interface, it:
-   - Creates the macvlan on the target host (simulating the endpoint appearing at a new access point).
-   - Deletes it from the old host (simulating departure).
-   - Sends a binary TLV registration to the LMEP server with the new VTEP IP.
-   - Queries `show evpn mac vni 1000 json` to confirm the MAC entry is present in the EVPN table.
-4. **Reports results** — stops captures and prints per-node BGP packet totals and MP_REACH/MP_UNREACH NLRI counts.
+1. **Sets up the topology** — creates bridges, VXLAN interfaces, and bonds across 7 VTEPs and 7 hosts.
+2. **Deploys 30 mobile VMs** — distributes MACVLAN endpoints round-robin across mobility-eligible hosts (vtep2–vtep7). Each VM also gets an initial LMEP registration.
+3. **Creates a static controller** — a fixed endpoint on vtep1/host1 that does not participate in mobility.
+4. **Starts packet captures** — begins tcpdump on BGP port 179 on spine1, vtep1, vtep2, and vtep3.
+5. **Runs 5 migration rounds** — in each round, all 30 VMs are migrated in batches of 5:
+   - Creates the macvlan at the destination host (brief duplicate-MAC window).
+   - Sends a binary TLV LMEP registration to the Mapping Server with the new VTEP IP.
+   - Deletes the macvlan from the source host.
+6. **Reports results** — stops captures and prints per-node BGP packet totals and MP_REACH/MP_UNREACH NLRI counts.
 
 ### `test_get_version`
 
