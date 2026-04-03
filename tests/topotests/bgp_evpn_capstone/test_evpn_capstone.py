@@ -58,7 +58,7 @@ NUM_HOSTS = 7  # One host per VTEP for VM mobility testing
 try:
     NUM_MOBILE_VMS = max(1, int(os.getenv("NUM_MOBILE_VMS", "20")))
 except ValueError:
-    NUM_MOBILE_VMS = 20
+    NUM_MOBILE_VMS = 30
 
 # Controller VTEPs participate in topology/BGP but are excluded from endpoint mobility.
 CONTROLLER_VTEPS = {"vtep1"}
