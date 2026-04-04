@@ -22,9 +22,12 @@ import struct
 import random
 import socket
 import shlex
-from time import sleep, time
+import subprocess
+import threading
+from time import sleep, time, strftime, localtime
 import platform
 import pytest
+import requests
 
 
 # Save the Current Working Directory to find configuration files.
@@ -42,6 +45,171 @@ pytestmark = [
     pytest.mark.bgpd,
     pytest.mark.pimd,
 ]
+
+
+#####################################################
+##   Visualizer Configuration
+#####################################################
+
+VISUALIZER_URL = "http://127.0.0.1:5000/event"
+VISUALIZER_HEALTH_URL = "http://127.0.0.1:5000/health"
+PACKET_CHART_URL = os.getenv("PACKET_CHART_URL", "http://127.0.0.1:5000/packet-chart")
+
+
+def env_flag(name, default="false"):
+    """Parse a bool-like environment variable with safe defaults."""
+    return os.getenv(name, default).strip().lower() not in {"0", "false", "no", "off"}
+
+
+ENABLE_LIVE_PACKET_GRAPH = env_flag("ENABLE_LIVE_PACKET_GRAPH", "true")
+AUTO_OPEN_PACKET_CHART_WINDOW = env_flag("AUTO_OPEN_PACKET_CHART_WINDOW", "false")
+AUTO_START_PACKET_CHART_SERVER = env_flag("AUTO_START_PACKET_CHART_SERVER", "false")
+
+try:
+    PACKET_SAMPLE_INTERVAL_SECONDS = max(
+        0.2,
+        float(os.getenv("PACKET_SAMPLE_INTERVAL_SECONDS", "1.0")),
+    )
+except ValueError:
+    PACKET_SAMPLE_INTERVAL_SECONDS = 1.0
+
+_LOCAL_VISUALIZER_PROCESS = None
+
+
+def send_vis_event(action, **kwargs):
+    """Safely send events to the visualizer server."""
+    try:
+        payload = {"action": action}
+        payload.update(kwargs)
+        requests.post(VISUALIZER_URL, json=payload, timeout=0.05)
+    except Exception:
+        pass
+
+
+def visualizer_is_reachable():
+    """Return True when the local visualizer HTTP server is responding."""
+    try:
+        response = requests.get(VISUALIZER_HEALTH_URL, timeout=0.2)
+        return response.status_code == 200
+    except Exception:
+        return False
+
+
+def maybe_start_local_visualizer_server():
+    """Start visualizer_server.py when packet graph mode is enabled and no server is running."""
+    if not (ENABLE_LIVE_PACKET_GRAPH and AUTO_START_PACKET_CHART_SERVER):
+        return None
+    if visualizer_is_reachable():
+        return None
+
+    server_script = os.path.join(CWD, "visualizer_server.py")
+    if not os.path.exists(server_script):
+        return None
+
+    try:
+        process = subprocess.Popen(
+            [sys.executable, server_script],
+            cwd=CWD,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as error:
+        print(f"WARNING: failed to start local visualizer server: {error}")
+        return None
+
+    deadline = time() + 4.0
+    while time() < deadline:
+        if visualizer_is_reachable():
+            print("Started local visualizer server for packet chart")
+            return process
+        sleep(0.2)
+
+    print("WARNING: visualizer server did not become reachable in time")
+    return process
+
+
+def maybe_open_packet_chart_window():
+    """Open the standalone packet chart in a browser window/tab."""
+    if not (ENABLE_LIVE_PACKET_GRAPH and AUTO_OPEN_PACKET_CHART_WINDOW):
+        return
+
+    system_name = platform.system()
+    command_candidates = []
+
+    if system_name == "Darwin":
+        command_candidates = [
+            ["open", "-n", PACKET_CHART_URL],
+            ["open", PACKET_CHART_URL],
+        ]
+    elif system_name == "Linux":
+        command_candidates = [["xdg-open", PACKET_CHART_URL]]
+    elif system_name == "Windows":
+        command_candidates = [["cmd", "/c", "start", "", PACKET_CHART_URL]]
+
+    for command in command_candidates:
+        try:
+            subprocess.Popen(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            print(f"Live packet chart opened at: {PACKET_CHART_URL}")
+            return
+        except Exception:
+            continue
+
+    print(f"WARNING: unable to auto-open packet chart URL: {PACKET_CHART_URL}")
+
+
+def parse_packet_count(packet_count):
+    """Return an integer packet count when available; otherwise None."""
+    try:
+        return int(packet_count)
+    except (TypeError, ValueError):
+        return None
+
+
+def start_live_packet_sampler(captures):
+    """Stream live packet totals to the chart page while tcpdump is running."""
+    if not ENABLE_LIVE_PACKET_GRAPH:
+        return None, None
+
+    interval = PACKET_SAMPLE_INTERVAL_SECONDS
+    stop_event = threading.Event()
+    state = {"last_total": 0}
+
+    send_vis_event("PACKET_SAMPLE_RESET")
+
+    def emit_one_sample():
+        counts = {}
+        total_packets = 0
+
+        for capture_name, (node, capture_file) in captures.items():
+            count_value = parse_packet_count(get_pcap_packet_count(node, capture_file))
+            counts[capture_name] = count_value
+            if count_value is not None:
+                total_packets += count_value
+
+        delta_packets = max(0, total_packets - state["last_total"])
+        state["last_total"] = total_packets
+
+        send_vis_event(
+            "PACKET_SAMPLE",
+            ts=strftime("%H:%M:%S", localtime()),
+            total_packets=total_packets,
+            delta_packets=delta_packets,
+            counts=counts,
+        )
+
+    def sampler_loop():
+        emit_one_sample()
+        while not stop_event.wait(interval):
+            emit_one_sample()
+
+    thread = threading.Thread(target=sampler_loop, name="packet-sampler", daemon=True)
+    thread.start()
+    return stop_event, thread
 
 
 #####################################################
@@ -133,6 +301,16 @@ def _send_lmep_registration_udp(server_host, server_port, mac, client_ip, vni, v
 def send_lmep_registration(server_host, mac, client_ip, vni, vtep_ip, port=LMEP_PORT):
     """Send a binary TLV LMEP registration for a VM endpoint."""
     _send_lmep_registration_udp(server_host, port, mac, client_ip, vni, vtep_ip)
+
+    # Visualizer hook: animate a registration flow to the LMEP server.
+    # Derive the source host from the VTEP IP for visual clarity.
+    vtep_name = None
+    for vname, vip in vtep_ips.items():
+        if vip == vtep_ip:
+            vtep_name = vname
+            break
+    source = vtep_name if vtep_name else "unknown"
+    send_vis_event("LMEP_REGISTER", source=source, vm=mac)
 
 
 #####################################################
@@ -314,12 +492,19 @@ def create_macvlan_endpoint(tgen, host_name, vm_name, ip, mac):
         f"failed to bring up {vm_name} on {host_name}",
     )
 
+    # VISUALIZER HOOK: Add VM node and link it to the host.
+    send_vis_event("ADD_NODE", id=vm_name, type="vm")
+    send_vis_event("ADD_LINK", source=vm_name, target=host_name)
+
 
 def delete_macvlan_endpoint(tgen, host_name, vm_name):
     """Delete one MACVLAN endpoint from a host namespace."""
     host = tgen.gears[host_name]
     result = host.run(f"ip link del {vm_name} >/dev/null 2>&1 && echo ok || echo failed").strip()
     assert result == "ok", f"failed to delete MACVLAN {vm_name} from {host_name}"
+
+    # VISUALIZER HOOK: Remove the link between the VM and the old host.
+    send_vis_event("DEL_LINK", source=vm_name, target=host_name)
 
 
 def delete_macvlan_endpoint_if_exists(tgen, host_name, vm_name):
@@ -564,26 +749,45 @@ def build_topo(tgen):
 
     spine1 = tgen.add_router("spine1")
     spine2 = tgen.add_router("spine2")
+    send_vis_event("ADD_NODE", id="spine1", type="spine")
+    send_vis_event("ADD_NODE", id="spine2", type="spine")
 
     # Create VTEPs and connect to both spines.
     for i in range(1, NUM_VTEPS + 1):
         vtep_name = f"vtep{i}"
         tgen.add_router(vtep_name)
+        send_vis_event("ADD_NODE", id=vtep_name, type="vtep")
+
         tgen.add_link(spine1, tgen.gears[vtep_name])
+        send_vis_event("ADD_LINK", source="spine1", target=vtep_name)
+
         tgen.add_link(spine2, tgen.gears[vtep_name])
+        send_vis_event("ADD_LINK", source="spine2", target=vtep_name)
 
     # Create hosts and distribute them across VTEPs.
     for i in range(1, NUM_HOSTS + 1):
         host_name = f"host{i}"
         tgen.add_router(host_name)
+        send_vis_event("ADD_NODE", id=host_name, type="host")
+
         vtep_idx = (i - 1) % NUM_VTEPS
         vtep_name = f"vtep{vtep_idx + 1}"
         tgen.add_link(tgen.gears[vtep_name], tgen.gears[host_name])
+        send_vis_event("ADD_LINK", source=vtep_name, target=host_name)
+
+    # Add the external LMEP Mapping Server as a visualizer-only node.
+    send_vis_event("ADD_NODE", id="lmep_server", type="lmep_server")
 
 
 @pytest.fixture(scope="module")
 def tgen(request):
     """Setup/Teardown the environment and provide tgen argument to tests."""
+
+    global _LOCAL_VISUALIZER_PROCESS
+
+    # Start the visualizer server before topology build so it captures ADD_NODE events.
+    _LOCAL_VISUALIZER_PROCESS = maybe_start_local_visualizer_server()
+    maybe_open_packet_chart_window()
 
     tgen = Topogen(build_topo, request.module.__name__)
     tgen.start_topology()
@@ -621,6 +825,12 @@ def tgen(request):
     finally:
         sys.stderr.close()
         sys.stderr = original_stderr
+        if _LOCAL_VISUALIZER_PROCESS is not None:
+            try:
+                _LOCAL_VISUALIZER_PROCESS.terminate()
+                _LOCAL_VISUALIZER_PROCESS.wait(timeout=2)
+            except Exception:
+                pass
 
 
 @pytest.fixture(autouse=True)
@@ -709,6 +919,17 @@ def test_host_movement(tgen):
         print(f"  {capture_name} capture: {pcap_file}")
 
     sleep(1)
+
+    # Start live packet sampler for the visualizer chart.
+    packet_sampler_stop = None
+    packet_sampler_thread = None
+    pcap_sampler_captures = {
+        name: (node, pcap_file)
+        for name, (node, pcap_file, _) in pcap_plan.items()
+    }
+    packet_sampler_stop, packet_sampler_thread = start_live_packet_sampler(
+        pcap_sampler_captures
+    )
 
     try:
 
@@ -799,6 +1020,11 @@ def test_host_movement(tgen):
         print("\nPhase 4: Post-migration checks complete.")
 
     finally:
+        if packet_sampler_stop is not None:
+            packet_sampler_stop.set()
+        if packet_sampler_thread is not None:
+            packet_sampler_thread.join(timeout=2)
+
         print("\nStopping BGP captures and collecting packet metrics...")
         for _, (node, _, pid_file) in pcap_plan.items():
             stop_bgp_capture(node, pid_file)

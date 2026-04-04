@@ -14,6 +14,7 @@ This folder contains the topotest setup for the Layer-2 Mapping & Encapsulation 
 - [Production vs Test Deployment](#production-vs-test-deployment)
 - [What the APs Need](#what-the-aps-need)
 - [How to Run Everything](#how-to-run-everything)
+- [Real-Time Visualizer](#real-time-visualizer)
 - [How to Verify It Works](#how-to-verify-it-works)
 - [What the Tests Validate](#what-the-tests-validate)
 - [Why This Reduces Control-Plane Traffic](#why-this-reduces-control-plane-traffic)
@@ -313,7 +314,23 @@ sudo python3 lmep_server.py \
 | `--source-ip` | `192.168.1.1` | The outer source IP placed in the VXLAN-encapsulated packets. Should be an IP reachable by the VTEPs. |
 | `--log-level` | `INFO` | Set to `DEBUG` for more verbose output, or `WARNING` to reduce noise. |
 
-### Step 2: Run the Test
+### Step 2: Start the Visualizer (optional)
+
+The test includes a real-time topology visualizer that shows the network graph, VM migrations, LMEP registrations, and a live packet rate chart — all in your browser. Start it in a second `tmux` pane alongside the LMEP server:
+
+```bash
+cd /Users/nathantam/Projects/capstone/tests/topotests/bgp_evpn_capstone_lmep/
+python3 visualizer_server.py
+```
+
+Then open these URLs in your browser:
+
+| URL | What it shows |
+|---|---|
+| `http://localhost:5000` | Live topology graph — spines, VTEPs, hosts, VMs, and the LMEP Mapping Server. VM migrations animate in real time, and purple dots show LMEP registration messages flowing to the server. |
+| `http://localhost:5000/packet-chart` | Live packet rate chart — plots BGP packet counts sampled from tcpdump captures during the test. |
+
+### Step 3: Run the Test
 
 In a separate terminal:
 
@@ -333,12 +350,24 @@ LMEP_PORT=6000 \
 sudo pytest -s tests/topotests/bgp_evpn_capstone_lmep/test_evpn_capstone_lmep.py
 ```
 
+**LMEP server variables:**
+
 | Variable | Default | Purpose |
 |---|---|---|
 | `LMEP_SERVER_HOST` | `127.0.0.1` | IP address where the LMEP server is reachable from the test process |
 | `LMEP_PORT` | `6000` | UDP port for TLV registrations (must match `--port` on the server) |
 | `LMEP_VXLAN_PORT` | `4789` | VXLAN destination port |
 | `LMEP_VNI` | `1000` | Default VXLAN Network Identifier used in registrations |
+
+**Visualizer variables:**
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ENABLE_LIVE_PACKET_GRAPH` | `true` | Enable/disable the entire visualizer system |
+| `AUTO_START_PACKET_CHART_SERVER` | `true` | Auto-launch `visualizer_server.py` if no server is already running |
+| `AUTO_OPEN_PACKET_CHART_WINDOW` | `true` | Auto-open the packet chart URL in your default browser |
+| `PACKET_SAMPLE_INTERVAL_SECONDS` | `1.0` | How often (in seconds) the test samples pcap files and pushes data to the chart |
+| `PACKET_CHART_URL` | `http://127.0.0.1:5000/packet-chart` | Override if the visualizer is running on a different host/port |
 
 ---
 
