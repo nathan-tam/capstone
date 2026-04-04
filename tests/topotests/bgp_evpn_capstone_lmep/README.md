@@ -81,23 +81,6 @@ Return traffic (from the robot to the controller) does **not** go through LMEP. 
 
 There are three separate components:
 
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│                        Host Machine                                    │
-│                                                                        │
-│  ┌──────────────────┐        ┌──────────────────────────────────────┐  │
-│  │  LMEP Server     │        │  Topotest (pytest)                   │  │
-│  │  (lmep_server.py)│ ◄────  │  Virtual topology with FRR routers   │  │
-│  │                  │  UDP   │                                      │  │
-│  │  • Listens for   │  TLV   │  2 spines ── 7 VTEPs ── 7 hosts     │  │
-│  │    registrations │  reg   │  vtep1 = controller (no mobility)    │  │
-│  │  • Sniffs packets│        │  vtep2-7 = mobility-eligible         │  │
-│  │  • Forwards via  │        │  30 mobile VMs across vtep2-7        │  │
-│  │    VXLAN         │        │                                      │  │
-│  └──────────────────┘        └──────────────────────────────────────┘  │
-└────────────────────────────────────────────────────────────────────────┘
-```
-
 1. **The LMEP Server** (`lmep_server.py`) — runs as a standalone Python process on the host machine. It does two things concurrently:
    - Listens on a UDP port (default `6000`) for binary TLV registration messages.
    - Uses Scapy to sniff packets on a network interface and forward matching traffic as VXLAN.
@@ -106,38 +89,14 @@ There are three separate components:
 
 3. **The FRR Topology** — a virtual network of spine switches, VTEPs, and hosts running inside Linux network namespaces. Each VTEP runs FRR with BGP/EVPN configured. The FRR configs are stored in `spine1/`, `spine2/`, `vtep1/`, `vtep2/`, `vtep3/` subdirectories.
 
-**Why is the LMEP server external (not inside the topology)?**
-
-The LMEP server runs on the host machine rather than inside a topotest namespace because:
-- It keeps the LMEP daemon **independent** from the test lifecycle — you can restart the test without restarting the server.
-- It avoids **namespace routing issues** — topotest namespaces are isolated and may not be able to reach each other easily for TCP/UDP connections.
-- It makes it easier to **debug** — you can watch the server logs in a separate tmux pane while the test runs.
-
 ---
 
-## The Test Topology
+### The Test Topology
 
-The test creates a spine-leaf fabric with 7 VTEPs and 7 hosts (matching the `bgp_evpn_capstone_asym` test for fair comparison):
-
-```
-             ┌────────┐           ┌────────┐
-             │ spine1 │           │ spine2 │
-             └┬┬┬┬┬┬┬┘           └┬┬┬┬┬┬┬┘
-              ││││││└───────┐      ││││││└───────┐
-              │││││└─────┐  │      │││││└─────┐  │
-              ││││└───┐  │  │      ││││└───┐  │  │
-              │││└─┐  │  │  │      │││└─┐  │  │  │
-              ││└┐ │  │  │  │      ││└┐ │  │  │  │
-              │└┐│ │  │  │  │      │└┐│ │  │  │  │
-              │ ││ │  │  │  │      │ ││ │  │  │  │
-          vtep1 vtep2 vtep3 vtep4 vtep5 vtep6 vtep7
-           │     │     │     │     │     │     │
-          host1 host2 host3 host4 host5 host6 host7
-```
+As with out other tests, this test creates a spine-leaf fabric with 7 VTEPs and 7 hosts:
 
 - **Spines** (`spine1`, `spine2`) — BGP route reflectors connecting all 7 VTEPs.
-- **Controller VTEP** (`vtep1`) — excluded from endpoint mobility. A static controller endpoint (`host1`) is attached here.
-- **Mobility VTEPs** (`vtep2`–`vtep7`) — leaf switches where mobile VM endpoints are created and migrated between.
+- **VTEPs** (`vtep1`–`vtep7`) — leaf switches that terminate VXLAN tunnels. All 7 participate in endpoint mobility.
 - **Hosts** (`host1`–`host7`) — one per VTEP, connected via bonded interfaces (`vtepbond`). The test creates **macvlan** VM interfaces on these hosts to simulate mobile endpoints.
 
 Each VTEP has:
@@ -419,17 +378,16 @@ The test file (`test_evpn_capstone_lmep.py`) contains two test functions:
 
 ### `test_host_movement`
 
-This is the main test, mirroring `bgp_evpn_capstone_asym`'s mobility simulation. It:
+This is the main test. It:
 
 1. **Sets up the topology** — creates bridges, VXLAN interfaces, and bonds across 7 VTEPs and 7 hosts.
-2. **Deploys 30 mobile VMs** — distributes MACVLAN endpoints round-robin across mobility-eligible hosts (vtep2–vtep7). Each VM also gets an initial LMEP registration.
-3. **Creates a static controller** — a fixed endpoint on vtep1/host1 that does not participate in mobility.
-4. **Starts packet captures** — begins tcpdump on BGP port 179 on spine1, vtep1, vtep2, and vtep3.
-5. **Runs 5 migration rounds** — in each round, all 30 VMs are migrated in batches of 5:
+2. **Deploys 30 mobile VMs** — distributes MACVLAN endpoints round-robin across all hosts. Each VM also gets an initial LMEP registration.
+3. **Starts packet captures** — begins tcpdump on BGP port 179 on spine1, vtep1, vtep2, and vtep3.
+4. **Runs 5 migration rounds** — in each round, all 30 VMs are migrated in batches of 5:
    - Creates the macvlan at the destination host (brief duplicate-MAC window).
    - Sends a binary TLV LMEP registration to the Mapping Server with the new VTEP IP.
    - Deletes the macvlan from the source host.
-6. **Reports results** — stops captures and prints per-node BGP packet totals and MP_REACH/MP_UNREACH NLRI counts.
+5. **Reports results** — stops captures and prints per-node BGP packet totals and MP_REACH/MP_UNREACH NLRI counts.
 
 ### `test_get_version`
 

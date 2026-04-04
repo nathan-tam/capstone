@@ -56,13 +56,6 @@ try:
 except ValueError:
     NUM_MOBILE_VMS = 30
 
-# Controller VTEPs participate in topology/BGP but are excluded from endpoint mobility.
-CONTROLLER_VTEPS = {"vtep1"}
-CONTROLLER_ENDPOINT_HOST = "host1"
-CONTROLLER_ENDPOINT_IFACE = "controller"
-CONTROLLER_ENDPOINT_IP = "192.168.100.254/16"
-CONTROLLER_ENDPOINT_MAC = "00:aa:bb:dd:00:01"
-
 # Migration tuning — matches bgp_evpn_capstone_asym defaults.
 try:
     MOBILITY_OVERLAP_SECONDS = max(0.0, float(os.getenv("MOBILITY_OVERLAP_SECONDS", "0.2")))
@@ -176,22 +169,13 @@ def host_to_vtep_index(host_index):
 
 
 def get_mobility_vtep_indices():
-    """Mobility-eligible VTEPs are all VTEPs not marked as controllers."""
-    return [
-        i
-        for i in range(1, NUM_VTEPS + 1)
-        if vtep_name_from_index(i) not in CONTROLLER_VTEPS
-    ]
+    """All VTEPs participate in mobility (no controller VTEP exclusion)."""
+    return list(range(1, NUM_VTEPS + 1))
 
 
 def get_mobility_host_indices():
-    """Mobility-eligible hosts are attached to mobility-eligible VTEPs."""
-    mobility_vtep_indices = set(get_mobility_vtep_indices())
-    return [
-        host_idx
-        for host_idx in range(1, NUM_HOSTS + 1)
-        if host_to_vtep_index(host_idx) in mobility_vtep_indices
-    ]
+    """All hosts participate in mobility."""
+    return list(range(1, NUM_HOSTS + 1))
 
 
 #####################################################
@@ -355,20 +339,6 @@ def macvlan_endpoint_exists(tgen, host_name, vm_name):
     return result == "present"
 
 
-def create_controller_endpoint(tgen):
-    """Create the static controller endpoint on the controller-side host."""
-    delete_macvlan_endpoint_if_exists(
-        tgen,
-        CONTROLLER_ENDPOINT_HOST,
-        CONTROLLER_ENDPOINT_IFACE,
-    )
-    create_macvlan_endpoint(
-        tgen,
-        CONTROLLER_ENDPOINT_HOST,
-        CONTROLLER_ENDPOINT_IFACE,
-        CONTROLLER_ENDPOINT_IP,
-        CONTROLLER_ENDPOINT_MAC,
-    )
 
 
 #####################################################
@@ -666,15 +636,15 @@ def skip_on_failure(tgen):
 def test_host_movement(tgen):
     """Simulate endpoint mobility across VTEPs with LMEP registration.
 
-    This test mirrors bgp_evpn_capstone_asym's mobility simulation but adds
-    binary TLV LMEP registration at each migration step.
+    All 7 VTEPs participate in mobility (no controller VTEP exclusion).
+    At each migration step, a binary TLV LMEP registration is sent to the
+    external Mapping Server.
 
     Steps:
-    1. Deploy mobile VMs distributed across mobility-eligible hosts
-    2. Create a static controller endpoint on the controller VTEP
-    3. Live-migrate the full VM set for MIGRATION_REPEAT_COUNT rounds
+    1. Deploy mobile VMs distributed across all hosts
+    2. Live-migrate the full VM set for MIGRATION_REPEAT_COUNT rounds
        (brief duplicate-MAC window with LMEP registration at each move)
-    4. Capture BGP packet data during migrations
+    3. Capture BGP packet data during migrations
     """
     if tgen.routers_have_failure():
         pytest.skip(f"skipped because of previous test failure\n {tgen.errors}")
@@ -741,8 +711,6 @@ def test_host_movement(tgen):
     sleep(1)
 
     try:
-        # Create static controller endpoint before mobility begins.
-        create_controller_endpoint(tgen)
 
         #####################################################
         # SECTION: Mobility Simulation
@@ -845,13 +813,6 @@ def test_host_movement(tgen):
             print()
 
         sleep(5)
-
-        # Remove controller endpoint.
-        delete_macvlan_endpoint_if_exists(
-            tgen,
-            CONTROLLER_ENDPOINT_HOST,
-            CONTROLLER_ENDPOINT_IFACE,
-        )
 
     if os.getenv("MUNET_CLI") == "1":
         tgen.mininet_cli()
