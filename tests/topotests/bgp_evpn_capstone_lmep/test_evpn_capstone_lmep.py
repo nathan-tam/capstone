@@ -29,6 +29,7 @@ import platform
 import pytest
 import requests
 
+mininet_lock = threading.Lock()
 
 # Save the Current Working Directory to find configuration files.
 CWD = os.path.dirname(os.path.realpath(__file__))
@@ -39,6 +40,7 @@ sys.path.append(os.path.join(CWD, "../"))
 from lib import topotest
 from lib.topogen import Topogen, TopoRouter, get_topogen
 from lib.topolog import logger
+from debug_tools import verify_ping
 
 # pytest module level markers
 pytestmark = [
@@ -247,6 +249,19 @@ try:
     )
 except ValueError:
     MIGRATION_BATCH_SETTLE_SECONDS = 0.6
+
+# Hold time after each batch for reachability pings.
+try:
+    REACHABILITY_HOLD_SECONDS = max(0.0, float(os.getenv("REACHABILITY_HOLD_SECONDS", "2.0")))
+except ValueError:
+    REACHABILITY_HOLD_SECONDS = 2.0
+
+# Static ping source — lives on host1 for the duration of the test.
+# This does NOT restrict vtep1 from mobility; it's only a ping source.
+CONTROLLER_ENDPOINT_HOST = "host1"
+CONTROLLER_ENDPOINT_IFACE = "controller"
+CONTROLLER_ENDPOINT_IP = "192.168.100.254/16"
+CONTROLLER_ENDPOINT_MAC = "00:aa:bb:dd:00:01"
 
 
 #####################################################
@@ -472,7 +487,8 @@ def create_macvlan_endpoint(tgen, host_name, vm_name, ip, mac):
     host = tgen.gears[host_name]
 
     def run_checked(command, error_message):
-        result = host.run(f"{command} >/dev/null 2>&1 && echo ok || echo failed").strip()
+        with mininet_lock:
+            result = host.run(f"{command} >/dev/null 2>&1 && echo ok || echo failed").strip()
         assert result == "ok", error_message
 
     run_checked(
@@ -500,7 +516,8 @@ def create_macvlan_endpoint(tgen, host_name, vm_name, ip, mac):
 def delete_macvlan_endpoint(tgen, host_name, vm_name):
     """Delete one MACVLAN endpoint from a host namespace."""
     host = tgen.gears[host_name]
-    result = host.run(f"ip link del {vm_name} >/dev/null 2>&1 && echo ok || echo failed").strip()
+    with mininet_lock:
+        result = host.run(f"ip link del {vm_name} >/dev/null 2>&1 && echo ok || echo failed").strip()
     assert result == "ok", f"failed to delete MACVLAN {vm_name} from {host_name}"
 
     # VISUALIZER HOOK: Remove the link between the VM and the old host.
@@ -510,18 +527,82 @@ def delete_macvlan_endpoint(tgen, host_name, vm_name):
 def delete_macvlan_endpoint_if_exists(tgen, host_name, vm_name):
     """Delete a MACVLAN endpoint if present, ignoring missing-interface cases."""
     host = tgen.gears[host_name]
-    host.run(f"ip link show {vm_name} >/dev/null 2>&1 && ip link del {vm_name} || true")
+    with mininet_lock:
+        host.run(f"ip link show {vm_name} >/dev/null 2>&1 && ip link del {vm_name} || true")
 
 
 def macvlan_endpoint_exists(tgen, host_name, vm_name):
     """Return True when endpoint interface exists on the host."""
     host = tgen.gears[host_name]
-    result = host.run(
-        "ip link show {0} >/dev/null 2>&1 && echo present || echo missing".format(
-            shlex.quote(vm_name)
-        )
-    ).strip()
+    with mininet_lock:
+        result = host.run(
+            "ip link show {0} >/dev/null 2>&1 && echo present || echo missing".format(
+                shlex.quote(vm_name)
+            )
+        ).strip()
     return result == "present"
+
+
+def create_controller_endpoint(tgen):
+    """Create the static controller endpoint used as a ping source."""
+    delete_macvlan_endpoint_if_exists(
+        tgen, CONTROLLER_ENDPOINT_HOST, CONTROLLER_ENDPOINT_IFACE
+    )
+    create_macvlan_endpoint(
+        tgen,
+        CONTROLLER_ENDPOINT_HOST,
+        CONTROLLER_ENDPOINT_IFACE,
+        CONTROLLER_ENDPOINT_IP,
+        CONTROLLER_ENDPOINT_MAC,
+    )
+
+
+def ping_batch_vms(tgen, migration_batch, vm_locations):
+    """Ping each VM in the batch from the controller asynchronously to verify reachability.
+
+    Waits REACHABILITY_HOLD_SECONDS for EVPN convergence in the background,
+    then sends one ping per VM. Returns a Thread object.
+    """
+    def ping_task():
+        if REACHABILITY_HOLD_SECONDS > 0:
+            sleep(REACHABILITY_HOLD_SECONDS)
+
+        for migration in migration_batch:
+            vm_name = migration["vm_name"]
+            vm_idx = int(vm_name.replace("vm", ""))
+            target_ip = f"192.168.100.{vm_idx}"
+            host_idx = vm_locations[vm_name][0]
+            host_name = f"host{host_idx}"
+
+            with mininet_lock:
+                ok = verify_ping(
+                    tgen,
+                    CONTROLLER_ENDPOINT_HOST,
+                    CONTROLLER_ENDPOINT_IFACE,
+                    target_ip,
+                    count=1,
+                    timeout_seconds=1,
+                )
+
+            ok_str = "OK" if ok else "FAILED"
+            print(
+                f"    [Background] Ping {vm_name} ({target_ip}) on {host_name} "
+                f"from {CONTROLLER_ENDPOINT_IFACE}@{CONTROLLER_ENDPOINT_HOST} ... {ok_str}",
+                flush=True,
+            )
+
+            if ok:
+                send_vis_event(
+                    "PACKET_FLOW",
+                    packet_type="PING",
+                    source=CONTROLLER_ENDPOINT_IFACE,
+                    target=vm_name,
+                    vm=vm_name,
+                )
+
+    thread = threading.Thread(target=ping_task, daemon=True)
+    thread.start()
+    return thread
 
 
 
@@ -931,6 +1012,9 @@ def test_host_movement(tgen):
         pcap_sampler_captures
     )
 
+    # Create a static controller endpoint on host1 as the ping source.
+    create_controller_endpoint(tgen)
+
     try:
 
         #####################################################
@@ -940,6 +1024,7 @@ def test_host_movement(tgen):
 
         # Track VM locations: {vm_name: (current_host_idx, current_vtep_idx)}
         vm_locations = {}
+        ping_threads = []
 
         # --- Phase 1: Deploy VMs on initial hosts ---
         print(f"Phase 1: Deploying {NUM_MOBILE_VMS} VMs on hosts...")
@@ -1014,7 +1099,16 @@ def test_host_movement(tgen):
                 if MIGRATION_BATCH_SETTLE_SECONDS > 0.0:
                     sleep(MIGRATION_BATCH_SETTLE_SECONDS)
 
-        sleep(5)
+                # Reachability check: hold VMs in place and ping from controller.
+                # Runs asynchronously in a background thread.
+                t = ping_batch_vms(tgen, migration_batch, vm_locations)
+                ping_threads.append(t)
+
+        print("  Waiting for background ping tasks to finish...")
+        for t in ping_threads:
+            t.join()
+
+        sleep(2)
 
         # --- Phase 4: Post-migration ---
         print("\nPhase 4: Post-migration checks complete.")
@@ -1024,6 +1118,11 @@ def test_host_movement(tgen):
             packet_sampler_stop.set()
         if packet_sampler_thread is not None:
             packet_sampler_thread.join(timeout=2)
+
+        # Clean up the controller endpoint.
+        delete_macvlan_endpoint_if_exists(
+            tgen, CONTROLLER_ENDPOINT_HOST, CONTROLLER_ENDPOINT_IFACE
+        )
 
         print("\nStopping BGP captures and collecting packet metrics...")
         for _, (node, _, pid_file) in pcap_plan.items():

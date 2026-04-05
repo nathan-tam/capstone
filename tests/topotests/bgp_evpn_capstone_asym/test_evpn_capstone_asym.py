@@ -22,6 +22,8 @@ import platform
 import pytest
 import requests
 
+mininet_lock = threading.Lock()
+
 VISUALIZER_URL = "http://127.0.0.1:5000/event"
 VISUALIZER_HEALTH_URL = "http://127.0.0.1:5000/health"
 PACKET_CHART_URL = os.getenv("PACKET_CHART_URL", "http://127.0.0.1:5000/packet-chart")
@@ -100,37 +102,6 @@ def maybe_start_local_visualizer_server():
     return process
 
 
-def maybe_open_packet_chart_window():
-    """Open the standalone packet chart in a browser window/tab."""
-    if not (ENABLE_LIVE_PACKET_GRAPH and AUTO_OPEN_PACKET_CHART_WINDOW):
-        return
-
-    system_name = platform.system()
-    command_candidates = []
-
-    if system_name == "Darwin":
-        command_candidates = [
-            ["open", "-n", PACKET_CHART_URL],
-            ["open", PACKET_CHART_URL],
-        ]
-    elif system_name == "Linux":
-        command_candidates = [["xdg-open", PACKET_CHART_URL]]
-    elif system_name == "Windows":
-        command_candidates = [["cmd", "/c", "start", "", PACKET_CHART_URL]]
-
-    for command in command_candidates:
-        try:
-            subprocess.Popen(
-                command,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            print(f"Live packet chart opened at: {PACKET_CHART_URL}")
-            return
-        except Exception:
-            continue
-
-    print(f"WARNING: unable to auto-open packet chart URL: {PACKET_CHART_URL}")
 
 
 def parse_packet_count(packet_count):
@@ -246,6 +217,12 @@ try:
     )
 except ValueError:
     MIGRATION_BATCH_SETTLE_SECONDS = 0.6
+
+# Hold time after each batch for reachability pings.
+try:
+    REACHABILITY_HOLD_SECONDS = max(0.0, float(os.getenv("REACHABILITY_HOLD_SECONDS", "2.0")))
+except ValueError:
+    REACHABILITY_HOLD_SECONDS = 2.0
 
 # Safety mode: if batch destination creation partially fails, roll back already-created
 # destination endpoints in that batch before re-raising the error.
@@ -685,7 +662,6 @@ def tgen(request):
 
     # Instantiate and start the topology.
     _LOCAL_VISUALIZER_PROCESS = maybe_start_local_visualizer_server()
-    maybe_open_packet_chart_window()
 
     tgen = Topogen(build_topo, request.module.__name__)
     tgen.start_topology()
@@ -752,7 +728,8 @@ def create_macvlan_endpoint(tgen, host_name, vm_name, ip, mac):
     print(f"Creating MACVLAN {vm_name} on {host_name} with IP {ip} MAC {mac}")
 
     def run_checked(command, error_message):
-        result = host.run(f"{command} >/dev/null 2>&1 && echo ok || echo failed").strip()
+        with mininet_lock:
+            result = host.run(f"{command} >/dev/null 2>&1 && echo ok || echo failed").strip()
         assert result == "ok", error_message
 
     run_checked(
@@ -782,7 +759,8 @@ def delete_macvlan_endpoint(tgen, host_name, vm_name):
     host = tgen.gears[host_name]
     print(f"Deleting MACVLAN {vm_name} from {host_name}")
 
-    result = host.run(f"ip link del {vm_name} >/dev/null 2>&1 && echo ok || echo failed").strip()
+    with mininet_lock:
+        result = host.run(f"ip link del {vm_name} >/dev/null 2>&1 && echo ok || echo failed").strip()
     assert result == "ok", f"failed to delete MACVLAN {vm_name} from {host_name}"
 
     # VISUALIZER HOOK: Remove the link between the VM and the old host
@@ -810,7 +788,56 @@ def create_controller_endpoint(tgen):
 def delete_macvlan_endpoint_if_exists(tgen, host_name, vm_name):
     """Delete a MACVLAN endpoint if present, ignoring missing-interface cases."""
     host = tgen.gears[host_name]
-    host.run(f"ip link show {vm_name} >/dev/null 2>&1 && ip link del {vm_name} || true")
+    with mininet_lock:
+        host.run(f"ip link show {vm_name} >/dev/null 2>&1 && ip link del {vm_name} || true")
+
+
+def ping_batch_vms(tgen, migration_batch, vm_locations):
+    """Ping each VM in the batch from the controller asynchronously to verify reachability.
+
+    Waits REACHABILITY_HOLD_SECONDS for EVPN convergence in the background,
+    then sends one ping per VM. Returns a Thread object.
+    """
+    def ping_task():
+        if REACHABILITY_HOLD_SECONDS > 0:
+            sleep(REACHABILITY_HOLD_SECONDS)
+
+        for migration in migration_batch:
+            vm_name = migration["vm_name"]
+            vm_idx = int(vm_name.replace("vm", ""))
+            target_ip = f"192.168.100.{vm_idx}"
+            host_idx = vm_locations[vm_name][0]
+            host_name = f"host{host_idx}"
+
+            with mininet_lock:
+                ok = verify_ping(
+                    tgen,
+                    CONTROLLER_ENDPOINT_HOST,
+                    CONTROLLER_ENDPOINT_IFACE,
+                    target_ip,
+                    count=1,
+                    timeout_seconds=1,
+                )
+
+            ok_str = "OK" if ok else "FAILED"
+            print(
+                f"    [Background] Ping {vm_name} ({target_ip}) on {host_name} "
+                f"from {CONTROLLER_ENDPOINT_IFACE}@{CONTROLLER_ENDPOINT_HOST} ... {ok_str}",
+                flush=True,
+            )
+            
+            if ok:
+                send_vis_event(
+                    "PACKET_FLOW",
+                    packet_type="PING",
+                    source=CONTROLLER_ENDPOINT_IFACE,
+                    target=vm_name,
+                    vm=vm_name,
+                )
+
+    thread = threading.Thread(target=ping_task, daemon=True)
+    thread.start()
+    return thread
 
 
 def run_post_mobility_controller_spotcheck(tgen, num_mobile_vms, vm_locations):
@@ -1039,6 +1066,7 @@ def test_mobility(tgen):
 
         # Track VM locations as: {vm_name: (current_host, current_vtep_idx)}.
         vm_locations = {}
+        ping_threads = []
 
         # --- Phase 1: deploy VMs on initial hosts --- #
         print(f"Phase 1: Deploying {NUM_MOBILE_VMS} VMs on hosts...")
@@ -1119,6 +1147,15 @@ def test_mobility(tgen):
 
                 if MIGRATION_BATCH_SETTLE_SECONDS > 0.0:
                     sleep(MIGRATION_BATCH_SETTLE_SECONDS)
+
+                # Reachability check: hold VMs in place and ping from controller.
+                # Runs asynchronously in a background thread.
+                t = ping_batch_vms(tgen, migration_batch, vm_locations)
+                ping_threads.append(t)
+
+        print("  Waiting for background ping tasks to finish...")
+        for t in ping_threads:
+            t.join()
 
         # Wait for all BGP/EVPN updates to process.
         sleep(5)

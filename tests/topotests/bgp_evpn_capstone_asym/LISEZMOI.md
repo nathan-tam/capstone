@@ -285,3 +285,22 @@ With both flags set:
 The test currently uses `learning on` with no `neigh_suppress`, so check 3 always passes. The spoke-to-spoke isolation enforced by the spine route-maps is **not exercised** by the test in its current form.
 
 The base `bgp_evpn_capstone` topology (full-mesh, all-to-all RTs) is unaffected — spoke-to-spoke traffic is the expected and correct behaviour there, and `learning on` works correctly in that context.
+
+---
+
+## Multi-Threaded Inter-Batch Reachability Pings
+
+To simulate realistic data-plane usage, this test contains a traffic verification step where a static controller endpoint (located on `vtep1` / `host1`) attempts to ping recently migrated mobile VMs. 
+
+Because EVPN route propagation requires a convergence window, a 5-second hold (`REACHABILITY_HOLD_SECONDS`) is observed before pinging. To ensure this delay does not artificially blockade the continuous mobility simulation, the reachability checks are **multi-threaded**.
+
+### How it works
+1. A batch of 5 VMs is migrated.
+2. The main Python thread instantly spawns a background `threading.Thread` to handle the pings for that batch.
+3. The main thread immediately proceeds to migrate the next batch of 5 VMs.
+4. Concurrently, the background thread sleeps for 5 seconds, and then issues the ICMP echo requests. 
+5. All interaction with the underlying virtual nodes is guarded by a global `mininet_lock` (`threading.Lock()`) to prevent concurrent `pexpect` shell corruption.
+
+### How to verify it is working
+- **Terminal Output**: When running the test (`sudo -E pytest -s tests/topotests/bgp_evpn_capstone_asym/test_evpn_capstone_asym.py`), you will see the `[Background] Ping vmX (192.168.100.X) ... OK` messages interleave asynchronously with the "Migrating batch Y" messages.
+- **Visualizer**: Open the topology visualizer in your browser. As the test runs, you will see cyan data-plane packet dots shooting from the static `controller` endpoint to the roaming `vm` endpoints, representing the concurrent data-plane ping reachability checks seamlessly happening alongside mobility events.

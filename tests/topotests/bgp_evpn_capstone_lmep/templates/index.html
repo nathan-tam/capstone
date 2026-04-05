@@ -36,6 +36,7 @@
         .packet-dot.reach { background: #39d353; }
         .packet-dot.unreach { background: #ff5a66; }
         .packet-dot.lmep-register { background: #b366ff; box-shadow: 0 0 14px rgba(179, 102, 255, 0.8); }
+        .packet-dot.ping { background: #00e5ff; box-shadow: 0 0 10px rgba(0, 229, 255, 0.8); }
 
         #packet-controls {
             margin-top: 10px;
@@ -63,6 +64,7 @@
             <div class="toggle-row"><input type="checkbox" id="toggle-reach" checked><label for="toggle-reach">Show BGP REACH</label></div>
             <div class="toggle-row"><input type="checkbox" id="toggle-unreach" checked><label for="toggle-unreach">Show BGP UNREACH</label></div>
             <div class="toggle-row"><input type="checkbox" id="toggle-lmep" checked><label for="toggle-lmep">Show LMEP Registrations</label></div>
+            <div class="toggle-row"><input type="checkbox" id="toggle-ping" checked><label for="toggle-ping">Show Data Plane Pings</label></div>
         </div>
     </div>
 
@@ -79,6 +81,7 @@
         var toggleReach = document.getElementById('toggle-reach');
         var toggleUnreach = document.getElementById('toggle-unreach');
         var toggleLmep = document.getElementById('toggle-lmep');
+        var togglePing = document.getElementById('toggle-ping');
 
         var data = { nodes: nodes, edges: edges };
 
@@ -308,6 +311,9 @@
             if (normalized === 'LMEP_REGISTER') {
                 return toggleLmep.checked;
             }
+            if (normalized === 'PING') {
+                return togglePing.checked;
+            }
             return true;
         }
 
@@ -315,6 +321,7 @@
             var normalized = String(packetType || '').toUpperCase();
             if (normalized === 'UNREACH') return 'unreach';
             if (normalized === 'LMEP_REGISTER') return 'lmep-register';
+            if (normalized === 'PING') return 'ping';
             return 'reach';
         }
 
